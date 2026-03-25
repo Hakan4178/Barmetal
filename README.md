@@ -37,8 +37,8 @@ sudo pacman -S linux-headers gcc make python python-pip
 2. **Derleme (Building Kernel Module):**
 Depoyu klonlayın ve kök dizinde `make` çalıştırın.
 ```bash
-git clone https://github.com/YourName/AntiGravity.git
-cd AntiGravity
+git clone https://github.com/Hakan4178/Linux-bare_metal_hypervizor-amd.git
+cd Linux-bare_metal_hypervizor-amd
 make clean && make -j$(nproc)
 ```
 *(Güvenlik denetimi yapılmış derleme ortamında "0 Warning, 0 Error" olarak çıkar).*
