@@ -6,6 +6,8 @@
 
 Dikkat BETA Oldukça fazla açık olabilir. Tested Zen 4. Dikkat gizli triple fault tehlikesi zincirleme risk!
 
+Dikkat proje eski guvensiz bir surumde takılmıştir triple fault yüzünden denemeyin! 
+
 Barmetal, modern **Endpoint Detection and Response (EDR)**, **Anti-Cheat** ve karmaşık **Custom VM (Packer, Obfuscator)** mimarilerini sıfır gecikme (zero-overhead) ve mutlak görünmezlikle (stealth) analiz etmek için baştan aşağı donanım yetenekleri kullanılarak geliştirilmiş *Ring -1* (Hypervisor) seviyesi bir "Virtual Machine Introspection" (VMI) motorudur.
 
 Eski usül "Kernel Hooking" veya "Debugging" yaklaşımlarını çöpe atar. Doğrudan AMD SVM (Secure Virtual Machine) komut setleri içine yerleşerek işletim sisteminin altından çalışır. 
