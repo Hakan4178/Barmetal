@@ -4,6 +4,8 @@
 [![Arch Linux](https://img.shields.io/badge/OS-Arch%20Linux-1793d1.svg)](https://archlinux.org/)
 [![Status](https://img.shields.io/badge/Status-Production%20Ready-success.svg)]()
 
+Dikkat BETA Oldukça fazla açık olabilir. Tested Zen 4.
+
 Barmetal, modern **Endpoint Detection and Response (EDR)**, **Anti-Cheat** ve karmaşık **Custom VM (Packer, Obfuscator)** mimarilerini sıfır gecikme (zero-overhead) ve mutlak görünmezlikle (stealth) analiz etmek için baştan aşağı donanım yetenekleri kullanılarak geliştirilmiş *Ring -1* (Hypervisor) seviyesi bir "Virtual Machine Introspection" (VMI) motorudur.
 
 Eski usül "Kernel Hooking" veya "Debugging" yaklaşımlarını çöpe atar. Doğrudan AMD SVM (Secure Virtual Machine) komut setleri içine yerleşerek işletim sisteminin altından çalışır. 
