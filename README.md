@@ -44,7 +44,7 @@ sudo pacman -S linux-headers gcc make python python-pip
 2. **Derleme (Building Kernel Module):**
 Depoyu klonlayın ve kök dizinde `make` çalıştırın.
 ```bash
-git clone https://github.com/Hakan4178/Linux-bare_metal_hypervizor-amd.git
+git clone https://github.com/Hakan4178/Barmetal.git
 cd Linux-bare_metal_hypervizor-amd
 make clean && make -j$(nproc)
 ```
