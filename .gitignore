@@ -3,6 +3,7 @@
 *.bak
 *.i64
 *.o.cmd
+*.bin
 *.ko
 *.cmd
 *.mod
