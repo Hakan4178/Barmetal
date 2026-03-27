@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Barmetal
 
 [![License: GPL v2](https://img.shields.io/badge/License-GPL%20v2-blue.svg)](https://www.gnu.org/licenses/old-licenses/gpl-2.0.en.html)
@@ -9,16 +10,32 @@ Kapatılan açık sayısı:95
 Dikkat BETA Oldukça fazla açık olabilir. Hay apoyu s...... sorunu çözedim ama ilerleme var blue pill olmayacagız hybrid bir çözum gelıstırdım kerneli adeta sarhoş edeceğiz ama öldürmeyeceğiz. Bilerek güncellemedim kodları. İsimler ve log kayıtları ntp_sync gibi masum isimler ile değişti uç noktalar güçlendiridi.
 
 Barmetal, modern **Endpoint Detection and Response (EDR)**, **Anti-Cheat** ve karmaşık **Custom VM (Packer, Obfuscator)** mimarilerini sıfır gecikme (zero-overhead) ve mutlak görünmezlikle (stealth) analiz etmek için baştan aşağı donanım yetenekleri kullanılarak geliştirilmiş *Ring -1* (Hypervisor) seviyesi bir "Virtual Machine Introspection" (VMI) motorudur.
+=======
+# AntiGravity - Advanced Ring -1 Hardware Hipervizörü (V6.0)
+
+[![License: GPL v2](https://img.shields.io/badge/License-GPL%20v2-blue.svg)](https://www.gnu.org/licenses/old-licenses/gpl-2.0.en.html)
+[![Arch Linux](https://img.shields.io/badge/OS-Arch%20Linux-1793d1.svg)](https://archlinux.org/)
+[![Status](https://img.shields.io/badge/Status-Production%20Ready-success.svg)]()
+
+AntiGravity, modern **Endpoint Detection and Response (EDR)**, **Anti-Cheat** ve karmaşık **Custom VM (Packer, Obfuscator)** mimarilerini sıfır gecikme (zero-overhead) ve mutlak görünmezlikle (stealth) analiz etmek için baştan aşağı donanım yetenekleri kullanılarak geliştirilmiş *Ring -1* (Hypervisor) seviyesi bir "Virtual Machine Introspection" (VMI) motorudur.
+>>>>>>> 4f7675a (V6.7 Yarı çözüm)
 
 Eski usül "Kernel Hooking" veya "Debugging" yaklaşımlarını çöpe atar. Doğrudan AMD SVM (Secure Virtual Machine) komut setleri içine yerleşerek işletim sisteminin altından çalışır. 
 
 ---
 
 ## 🔥 Neden Üretim (Production) Kalitesi?
+<<<<<<< HEAD
 Bu yazılım akademik bir PoC'a yakın daha tam bitmedi.
 - **Lockless 64MB Ring Buffer IPC**: Hipervizör ve kullanıcı alanı (User-space Python daemon) arasındaki veri kopyalama işlemlerinde Mutex (kilit) kullanılmaz. Bellek bariyerleri (`smp_wmb`/`smp_rmb`) sayesinde saniyede milyonlarca event %0 işlemci darboğazı ile çekilir.
 - **Sıfır TOCTOU ve Integer Overflow**: Kernel - User space geçişleri (copy_to_user, copy_from_user) ve snapshot boyut hesaplamaları pointer aritmetiği taşmalarına (Zero-Day) karşı yamalanmıştır.
 - **Kesintisiz TSC Telafisi (Soft-Lockup Koruması)**: Zararlı yazılım hipervizörün varlığını RDTSC (`Read Time-Stamp Counter`) ile tespit edemez; tüm analiz zaman gecikmeleri donanımdan matematiksel olarak çıkarılır (Stealth Offset). (Abart GPT)
+=======
+Bu yazılım akademik bir PoC'den ziyade, sahada kullanılmaya hazır bir motor haline gelmiştir. **Code Audit (Güvenlik Denetimi)** süreçlerinden geçirilmiş olup:
+- **Lockless 64MB Ring Buffer IPC**: Hipervizör ve kullanıcı alanı (User-space Python daemon) arasındaki veri kopyalama işlemlerinde Mutex (kilit) kullanılmaz. Bellek bariyerleri (`smp_wmb`/`smp_rmb`) sayesinde saniyede milyonlarca event %0 işlemci darboğazı ile çekilir.
+- **Sıfır TOCTOU ve Integer Overflow**: Kernel - User space geçişleri (copy_to_user, copy_from_user) ve snapshot boyut hesaplamaları pointer aritmetiği taşmalarına (Zero-Day) karşı yamalanmıştır.
+- **Kesintisiz TSC Telafisi (Soft-Lockup Koruması)**: Zararlı yazılım hipervizörün varlığını RDTSC (`Read Time-Stamp Counter`) ile tespit edemez; tüm analiz zaman gecikmeleri donanımdan matematiksel olarak çıkarılır (Stealth Offset).
+>>>>>>> 4f7675a (V6.7 Yarı çözüm)
 
 ---
 
@@ -27,7 +44,10 @@ Bu yazılım akademik bir PoC'a yakın daha tam bitmedi.
 - 🔴 **Phase 1 - LBR Code Tracing:** AMD'nin donanımsal Last Branch Record (LBR) MSR'lerini kullanarak, çalışan Guest'in yaptığı tüm zıplamaları (Indirect JMP/CALL) sıfır yavaşlama ile çeker. Custom VM Dispatcher analizinde haftalar harcamak yerine, program akış ağacını saniyeler içinde verir.
 - 🔴 **Phase 2 - MTF & NPF Dirty Page Data Tracing:** NPT yazma izinleri özel sayfalar için kaldırılır. Zararlı `pack` edildiği şifreyi çözmeye çalıştığında (Unpacking / Decryption) oluşan `#NPF` (Nested Page Fault) exceptionu saniyesinde yakalanır, o sayfa temiz `.bin` olarak dosyaya atılır. Ardından **MTF (Monitor Trap Flag)** kurularak iz silinir.
 - 🔴 **Phase 3 - Live Dashboard & Shannon Entropy:** Sürekli Ring -1'den gelen LBR geçmişi ile Mutasyonları (Memory Writes) kronolojik olarak birleştirir. Bir dosya yazıldığında anında %0-100 arası Entropi hesabı yapar. `7.5` değerinin üzerindeyse otomatik olarak `AES/RSA Key veya Şifreli Payload` olarak işaretler. Dilerseniz son LBR adımlarıyla beraber detaylı offline-analiz text raporu oluşturur.
+<<<<<<< HEAD
 - Phase 4 Video kaydı gibi olacak tam entegrasyon grafikler vb frontend gelişecek.
+=======
+>>>>>>> 4f7675a (V6.7 Yarı çözüm)
 
 ---
 
@@ -42,8 +62,13 @@ sudo pacman -S linux-headers gcc make python python-pip
 2. **Derleme (Building Kernel Module):**
 Depoyu klonlayın ve kök dizinde `make` çalıştırın.
 ```bash
+<<<<<<< HEAD
 git clone https://github.com/Hakan4178/Barmetal.git
 cd Barmetal
+=======
+git clone https://github.com/YourName/AntiGravity.git
+cd AntiGravity
+>>>>>>> 4f7675a (V6.7 Yarı çözüm)
 make clean && make -j$(nproc)
 ```
 *(Güvenlik denetimi yapılmış derleme ortamında "0 Warning, 0 Error" olarak çıkar).*
@@ -100,4 +125,7 @@ Eğer analizinizi bitirdiyseniz hipervizörü OS'un bellek tablosundan söküp a
 ```bash
 sudo rmmod ring_minus_one
 ```
+<<<<<<< HEAD
 Not: Bunu unutmayın 10 dakikadan uzun bırakmayın (Memory leak ve atak yuzeyı yuzunde)
+=======
+>>>>>>> 4f7675a (V6.7 Yarı çözüm)

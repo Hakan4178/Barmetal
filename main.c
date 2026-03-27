@@ -1,5 +1,12 @@
 /*
+<<<<<<< HEAD
  * main.c — Module Init/Exit + VMCB Prepare (V6.7 Stealth) 
+=======
+ * main.c — Module Init/Exit + VMCB Prepare (V4.0 Stealth)
+ *
+ * Module lifecycle: SVM hardware init, test VMRUN, proc entries.
+ * vmcb_prepare_npt: Full VMCB configuration with V4.0 stealth intercepts.
+>>>>>>> 4f7675a (V6.7 Yarı çözüm)
  */
 
 #include <linux/kallsyms.h>
@@ -23,6 +30,7 @@ MODULE_IMPORT_NS("KVM_AMD");
 static struct svm_context svm_ctx = {0};
 static struct snap_context snap_ctx;
 
+<<<<<<< HEAD
 /* 
  * Kworker for continuous testing / LBR trace generation.
  * (V6.7 Paranoid Stealth Mode: NTP disguised)
@@ -71,6 +79,9 @@ static int guest_kthread(void *data)
     }
     return 0;
 }
+=======
+	/* Removed: guest_kthread loop */
+>>>>>>> 4f7675a (V6.7 Yarı çözüm)
 
 struct svm_context *g_svm = &svm_ctx;
 struct snap_context *g_snap = &snap_ctx;
@@ -310,6 +321,7 @@ int vmcb_prepare_npt(struct svm_context *ctx, u64 g_rip, u64 g_rsp, u64 g_cr3)
 
 static int __init svm_module_init(void)
 {
+<<<<<<< HEAD
     u64 efer_val, cr0, cr4, rflags;
     unsigned long cr3;
     u16 cs, ds, ss, es, fs, gs, tr;
@@ -326,6 +338,12 @@ static int __init svm_module_init(void)
      * forces execution onto CPU 0, VMRUN Triple Faults immediately.
      */
     set_cpus_allowed_ptr(current, cpumask_of(0));
+=======
+    u64 efer_val;
+    int ret;
+
+    /* Phase 3.1: No longer binding entire module init to CPU 0 */
+>>>>>>> 4f7675a (V6.7 Yarı çözüm)
 
     pr_info("=== SVM Modülü Başlatılıyor ===\n");
 
@@ -392,6 +410,7 @@ static int __init svm_module_init(void)
     }
     svm_ctx.iopm_pa = virt_to_phys(svm_ctx.iopm_va);
 
+<<<<<<< HEAD
     /* 8) Guest kod ve stack */
     svm_ctx.code_page  = (u8 *)__get_free_page(GFP_KERNEL | __GFP_ZERO);
     svm_ctx.stack_page = (u8 *)__get_free_page(GFP_KERNEL | __GFP_ZERO);
@@ -442,6 +461,11 @@ static int __init svm_module_init(void)
     vmcb_prepare_npt(&svm_ctx, (u64)svm_ctx.code_page, guest_rsp, cr3 & 0xFFFFFFFFFFFFF000ULL);
 
 
+=======
+    /* Note: VMCB preparation will now happen dynamically during ioctl
+     * inside the context of the user-space process. We do not set up 
+     * dummy guest static fields here anymore. */
+>>>>>>> 4f7675a (V6.7 Yarı çözüm)
     /* ── Proc entries & Trace Init (MUST BE BEFORE VMRUN) ── */
     ret = procfs_init(&snap_ctx);
     if (ret)
@@ -460,6 +484,7 @@ static int __init svm_module_init(void)
         goto err_npt;
     }
 
+<<<<<<< HEAD
     pr_info("=== Sürekli Stealth KThread Başlatılıyor (kworker/u4:ntp) ===\n");
 
     /* 
@@ -499,6 +524,20 @@ err_guest:
         free_pages((unsigned long)svm_ctx.iopm_va, 2);
         svm_ctx.iopm_va = NULL;
     }
+=======
+    ret = svm_ghost_init();
+    if (ret) {
+        svm_chardev_exit();
+        svm_trace_cleanup();
+        procfs_exit(&snap_ctx);
+        goto err_npt;
+    }
+
+    pr_info(">>> BAŞARILI! Modül arka planda sessizce /dev/ntp_sync üzerinden hedef bekliyor <<<\n");
+    return 0;
+
+
+>>>>>>> 4f7675a (V6.7 Yarı çözüm)
 err_msrpm:
     if (svm_ctx.msrpm_va) {
         free_pages((unsigned long)svm_ctx.msrpm_va, 4);
@@ -533,12 +572,18 @@ static void __exit svm_module_exit(void)
      */
     set_cpus_allowed_ptr(current, cpumask_of(0));
 
+<<<<<<< HEAD
     if (guest_thread) {
         kthread_stop(guest_thread);
         guest_thread = NULL;
         pr_info("Kthread başarıyla durduruldu.\n");
     }
 
+=======
+    /* Phase 3.1: No kthread cleanup anymore */
+
+    svm_ghost_exit();
+>>>>>>> 4f7675a (V6.7 Yarı çözüm)
     svm_chardev_exit();
     svm_trace_cleanup();
 
@@ -551,6 +596,7 @@ static void __exit svm_module_exit(void)
     efer_val &= ~EFER_SVME;
     wrmsrl(MSR_EFER, efer_val);
 
+<<<<<<< HEAD
     if (svm_ctx.code_page) {
         if (my_set_memory_nx) {
             if (my_set_memory_nx((unsigned long)svm_ctx.code_page, 1))
@@ -563,6 +609,9 @@ static void __exit svm_module_exit(void)
         free_page((unsigned long)svm_ctx.stack_page);
         svm_ctx.stack_page = NULL;
     }
+=======
+    /* Phase 3.1: No dummy code payload cleanup anymore */
+>>>>>>> 4f7675a (V6.7 Yarı çözüm)
     if (svm_ctx.iopm_va) {
         free_pages((unsigned long)svm_ctx.iopm_va, 2);
         svm_ctx.iopm_va = NULL;

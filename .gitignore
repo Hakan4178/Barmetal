@@ -1,0 +1,11 @@
+# Build artıkları
+*.o
+*.o.cmd
+*.ko
+*.cmd
+*.mod
+*.mod.c
+*.symvers
+*.order
+modules.order
+Module.symvers

@@ -24,7 +24,11 @@
 #define RFLAGS_TF            (1ULL << 8)
 
 /* Pending NPF re-arm GPA: after MTF fires we strip NPT_WRITE again */
+<<<<<<< HEAD
 static u64 pending_rearm_gpa;
+=======
+static DEFINE_PER_CPU(u64, pending_rearm_gpa);
+>>>>>>> 4f7675a (V6.7 Yarı çözüm)
 
 #define VMEXIT_MAX_ITERATIONS 100000
 
@@ -38,6 +42,7 @@ static u64 pending_rearm_gpa;
  *  Uses a fast 64-bit LCG (Linear Congruential Generator).
  * ═══════════════════════════════════════════════════════════════════════════ */
 
+<<<<<<< HEAD
 static u64 jitter_state = 0x5DEECE66DULL;
 
 static inline u64 tsc_jitter(u64 min, u64 max)
@@ -45,6 +50,19 @@ static inline u64 tsc_jitter(u64 min, u64 max)
     /* LCG: state = state * 6364136223846793005 + 1442695040888963407 */
     jitter_state = jitter_state * 6364136223846793005ULL + 1442695040888963407ULL;
     return min + ((jitter_state >> 33) % (max - min + 1));
+=======
+static DEFINE_PER_CPU(u64, jitter_state);
+
+static inline u64 tsc_jitter(u64 min, u64 max)
+{
+    u64 *state = this_cpu_ptr(&jitter_state);
+    if (!*state)
+        *state = 0x5DEECE66DULL ^ rdtsc();
+        
+    /* LCG: state = state * 6364136223846793005 + 1442695040888963407 */
+    *state = *state * 6364136223846793005ULL + 1442695040888963407ULL;
+    return min + ((*state >> 33) % (max - min + 1));
+>>>>>>> 4f7675a (V6.7 Yarı çözüm)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -61,6 +79,11 @@ static void handle_cpuid(struct vmcb *vmcb, struct guest_regs *regs)
     u32 subleaf = (u32)regs->rcx;
     u32 eax, ebx, ecx, edx;
 
+<<<<<<< HEAD
+=======
+    /* Güvenlik: Maksimum desteklenen leaf CPUID sorgusuna passthrough edilir, #GP enjeksiyonundan vazgeçildi */
+
+>>>>>>> 4f7675a (V6.7 Yarı çözüm)
     /* Execute real CPUID on the host CPU */
     cpuid_count(leaf, subleaf, &eax, &ebx, &ecx, &edx);
 
@@ -100,6 +123,12 @@ static void handle_msr(struct vmcb *vmcb, struct guest_regs *regs)
     bool is_write = vmcb->control.exit_info_1 & 1;
     u64 val;
 
+<<<<<<< HEAD
+=======
+    /* Beklenmeyen MSR istekleri 'default' case ile maskelenir ve safe olarak 0 dönülür, 
+       AMD'nin gelecekteki geçerli MSR range'lerini kestiğimiz için burada manuel #GP enjeksiyonundan vazgeçildi. */
+
+>>>>>>> 4f7675a (V6.7 Yarı çözüm)
     if (is_write) {
         /*
          * Silently ignore writes to intercepted MSRs.
@@ -216,10 +245,21 @@ static void handle_ioio(struct vmcb *vmcb, struct guest_regs *regs)
     /* OUT: silently drop */
 
     /* Use NRIPS (hardware-provided next RIP) if available */
+<<<<<<< HEAD
     if (vmcb->control.next_rip)
         vmcb->save.rip = vmcb->control.next_rip;
     else
         vmcb->save.rip += 1;  /* Conservative: IN al,dx = 1 byte (EC) */
+=======
+    if (vmcb->control.next_rip) {
+        u64 next_rip = vmcb->control.next_rip;
+        /* İşlemci zaten VMRUN ve branch işlemlerinde Non-canonical hesaplamasını yapıp #GP üretecektir, 
+           bu manuel kontrol gereksiz bir redundancydir ve hardware layerina devredildi. */
+        vmcb->save.rip = next_rip;
+    } else {
+        vmcb->save.rip += 1;  /* Conservative: IN al,dx = 1 byte (EC) */
+    }
+>>>>>>> 4f7675a (V6.7 Yarı çözüm)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -255,7 +295,11 @@ static DEFINE_PER_CPU(u64, last_guest_rip);
 
 int svm_run_guest(struct svm_context *ctx)
 {
+<<<<<<< HEAD
     struct guest_regs regs = {0};
+=======
+    struct guest_regs *regs = kzalloc(sizeof(*regs), GFP_KERNEL);
+>>>>>>> 4f7675a (V6.7 Yarı çözüm)
     u64 exit_code;
     int iter = VMEXIT_MAX_ITERATIONS;
     int ret = 0;
@@ -263,6 +307,18 @@ int svm_run_guest(struct svm_context *ctx)
     s64 *offset;
     u64 host_start;
 
+<<<<<<< HEAD
+=======
+    /* Dynamic Host Context Preservation */
+    u64 host_kernel_gs_base, host_star, host_lstar;
+    u64 host_cstar, host_sfmask;
+    u64 host_sysenter_cs, host_sysenter_esp, host_sysenter_eip;
+    u64 host_fs_base, host_gs_base;
+    u16 host_fs_sel, host_gs_sel, host_ldt_sel;
+
+    if (!regs) return -ENOMEM;
+
+>>>>>>> 4f7675a (V6.7 Yarı çözüm)
     pr_info("[VMEXIT] Entering guest dispatch loop (Predictive Context)\n");
 
     /* İlk VMRUN */
@@ -273,7 +329,48 @@ int svm_run_guest(struct svm_context *ctx)
     preempt_disable();
     local_irq_save(flags);
 
+<<<<<<< HEAD
     vmrun_with_regs(ctx->vmcb_pa, &regs);
+=======
+    /* ── SAVE DYNAMIC HOST CONTEXT BEFORE VMRUN ── */
+    asm volatile("mov %%fs, %0" : "=rm"(host_fs_sel));
+    asm volatile("mov %%gs, %0" : "=rm"(host_gs_sel));
+    asm volatile("sldt %0" : "=rm"(host_ldt_sel));
+    
+    host_fs_base        = native_read_msr(MSR_FS_BASE);
+    host_gs_base        = native_read_msr(MSR_GS_BASE);
+    host_kernel_gs_base = native_read_msr(MSR_KERNEL_GS_BASE);
+    host_star           = native_read_msr(MSR_STAR);
+    host_lstar          = native_read_msr(MSR_LSTAR);
+    host_cstar          = native_read_msr(MSR_CSTAR);
+    host_sfmask         = native_read_msr(MSR_SYSCALL_MASK);
+    host_sysenter_cs    = native_read_msr(MSR_IA32_SYSENTER_CS);
+    host_sysenter_esp   = native_read_msr(MSR_IA32_SYSENTER_ESP);
+    host_sysenter_eip   = native_read_msr(MSR_IA32_SYSENTER_EIP);
+
+    vmrun_with_regs(ctx->vmcb_pa, regs);
+
+    /*
+     * CRITICAL: Do NOT reload FS/GS selectors!
+     * 'mov %%gs' zeroes GS_BASE, creating a window where NMI
+     * (which CANNOT be masked by CLI) would access per_cpu via
+     * GS_BASE=0 → triple fault. In 64-bit mode, only the MSR
+     * base matters, not the selector value. Write MSRs directly.
+     */
+    asm volatile("lldt %0" :: "rm"(host_ldt_sel));
+
+    native_write_msr(MSR_FS_BASE,          host_fs_base);
+    native_write_msr(MSR_GS_BASE,          host_gs_base);
+    native_write_msr(MSR_KERNEL_GS_BASE,   host_kernel_gs_base);
+    native_write_msr(MSR_STAR,             host_star);
+    native_write_msr(MSR_LSTAR,            host_lstar);
+    native_write_msr(MSR_CSTAR,            host_cstar);
+    native_write_msr(MSR_SYSCALL_MASK,     host_sfmask);
+    native_write_msr(MSR_IA32_SYSENTER_CS, host_sysenter_cs);
+    native_write_msr(MSR_IA32_SYSENTER_ESP,host_sysenter_esp);
+    native_write_msr(MSR_IA32_SYSENTER_EIP,host_sysenter_eip);
+
+>>>>>>> 4f7675a (V6.7 Yarı çözüm)
     host_start = rdtsc();
 
     local_irq_restore(flags);
@@ -326,7 +423,11 @@ int svm_run_guest(struct svm_context *ctx)
         /* ── Dispatch (Host İşlemleri) ── */
         switch (exit_code) {
         case SVM_EXIT_CPUID:
+<<<<<<< HEAD
             handle_cpuid(ctx->vmcb, &regs);
+=======
+            handle_cpuid(ctx->vmcb, regs);
+>>>>>>> 4f7675a (V6.7 Yarı çözüm)
             break;
 
         case SVM_EXIT_HLT:
@@ -335,16 +436,28 @@ int svm_run_guest(struct svm_context *ctx)
             goto out;
 
         case SVM_EXIT_MSR:
+<<<<<<< HEAD
             handle_msr(ctx->vmcb, &regs);
             break;
 
         case SVM_EXIT_IOIO:
             handle_ioio(ctx->vmcb, &regs);
+=======
+            handle_msr(ctx->vmcb, regs);
+            break;
+
+        case SVM_EXIT_IOIO:
+            handle_ioio(ctx->vmcb, regs);
+>>>>>>> 4f7675a (V6.7 Yarı çözüm)
             break;
 
 #ifdef SVM_EXIT_RDTSCP
         case SVM_EXIT_RDTSCP:
+<<<<<<< HEAD
             handle_rdtscp(ctx->vmcb, &regs);
+=======
+            handle_rdtscp(ctx->vmcb, regs);
+>>>>>>> 4f7675a (V6.7 Yarı çözüm)
             break;
 #endif
 
@@ -354,6 +467,13 @@ int svm_run_guest(struct svm_context *ctx)
             u64 gpa   = ctx->vmcb->control.exit_info_2;
 
             if (info1 & NPF_INFO1_WRITE) {
+<<<<<<< HEAD
+=======
+                /* Fiziksel sayfa sınırları kontrolü (Arbitrary Kernel Write Engelleme) */
+                if (!pfn_valid(gpa >> PAGE_SHIFT))
+                    break;
+                    
+>>>>>>> 4f7675a (V6.7 Yarı çözüm)
                 /* Copy the 4KB page at fault GPA into the trace ring */
                 void *hva = phys_to_virt(gpa & PAGE_MASK);
                 svm_trace_emit_dirty(
@@ -368,18 +488,38 @@ int svm_run_guest(struct svm_context *ctx)
                     int pml4i = (gpa >> 39) & 0x1FF;
                     int pdpti = (gpa >> 30) & 0x1FF;
                     int pdi   = (gpa >> 21) & 0x1FF;
+<<<<<<< HEAD
                     u64 *pdpt = phys_to_virt(pml4[pml4i] & ~0xFFFULL);
                     u64 *pd   = phys_to_virt(pdpt[pdpti] & ~0xFFFULL);
                     pd[pdi]  |= NPT_WRITE;
                 }
 
+=======
+                    
+                    u64 pdpt_phys = pml4[pml4i] & ~0xFFFULL;
+                    if (!pdpt_phys || !pfn_valid(pdpt_phys >> PAGE_SHIFT)) goto skip_rearm;
+                    u64 *pdpt = phys_to_virt(pdpt_phys);
+                    
+                    u64 pd_phys = pdpt[pdpti] & ~0xFFFULL;
+                    if (!pd_phys || !pfn_valid(pd_phys >> PAGE_SHIFT)) goto skip_rearm;
+                    u64 *pd   = phys_to_virt(pd_phys);
+                    
+                    pd[pdi]  |= NPT_WRITE;
+                }
+
+skip_rearm:
+>>>>>>> 4f7675a (V6.7 Yarı çözüm)
                 /* Arm MTF: set guest RFLAGS.TF + intercept #DB so the
                  * very next guest instruction triggers a VMEXIT.  In the
                  * #DB handler we strip NPT_WRITE again to catch the next
                  * mutation. */
                 ctx->vmcb->save.rflags |= RFLAGS_TF;
                 ctx->vmcb->control.intercepts[INTERCEPT_EXCEPTION] |= EXCEPT_DB_BIT;
+<<<<<<< HEAD
                 pending_rearm_gpa = gpa & PAGE_MASK;
+=======
+                *this_cpu_ptr(&pending_rearm_gpa) = gpa & PAGE_MASK;
+>>>>>>> 4f7675a (V6.7 Yarı çözüm)
 
                 /* Dirty NP and intercept clean bits */
                 ctx->vmcb->control.clean &= ~(VMCB_CLEAN_NP | VMCB_CLEAN_INTERCEPTS);
@@ -390,11 +530,17 @@ int svm_run_guest(struct svm_context *ctx)
 
         /* ── Phase 3: MTF Completion — Re-arm write protection ──────── */
         case SVM_EXIT_EXCP_BASE + 1: {  /* #DB */
+<<<<<<< HEAD
+=======
+            u64 *p_rearm = this_cpu_ptr(&pending_rearm_gpa);
+            
+>>>>>>> 4f7675a (V6.7 Yarı çözüm)
             /* Strip TF, clear #DB intercept */
             ctx->vmcb->save.rflags &= ~RFLAGS_TF;
             ctx->vmcb->control.intercepts[INTERCEPT_EXCEPTION] &= ~EXCEPT_DB_BIT;
 
             /* Re-strip NPT_WRITE on the page we just allowed to write */
+<<<<<<< HEAD
             if (pending_rearm_gpa) {
                 u64 g = pending_rearm_gpa;
                 u64 *pml4 = ctx->npt.pml4;
@@ -405,6 +551,27 @@ int svm_run_guest(struct svm_context *ctx)
                 u64 *pd   = phys_to_virt(pdpt[pdpti] & ~0xFFFULL);
                 pd[pdi]  &= ~NPT_WRITE;
                 pending_rearm_gpa = 0;
+=======
+            if (*p_rearm) {
+                u64 g = *p_rearm;
+                if (pfn_valid(g >> PAGE_SHIFT)) {
+                    u64 *pml4 = ctx->npt.pml4;
+                    int pml4i = (g >> 39) & 0x1FF;
+                    int pdpti = (g >> 30) & 0x1FF;
+                    int pdi   = (g >> 21) & 0x1FF;
+                    
+                    u64 pdpt_phys = pml4[pml4i] & ~0xFFFULL;
+                    if (pdpt_phys && pfn_valid(pdpt_phys >> PAGE_SHIFT)) {
+                        u64 *pdpt = phys_to_virt(pdpt_phys);
+                        u64 pd_phys = pdpt[pdpti] & ~0xFFFULL;
+                        if (pd_phys && pfn_valid(pd_phys >> PAGE_SHIFT)) {
+                            u64 *pd = phys_to_virt(pd_phys);
+                            pd[pdi] &= ~NPT_WRITE;
+                        }
+                    }
+                }
+                *p_rearm = 0;
+>>>>>>> 4f7675a (V6.7 Yarı çözüm)
             }
             ctx->vmcb->control.clean &= ~(VMCB_CLEAN_NP | VMCB_CLEAN_INTERCEPTS);
             /* No RIP advance: resume at the instruction after the write */
@@ -426,6 +593,7 @@ int svm_run_guest(struct svm_context *ctx)
         /* ── Phase 2: LBR Chronological Drain ── */
         svm_trace_emit_lbr(ctx->vmcb->save.cr3, ctx->vmcb->save.rip);
 
+<<<<<<< HEAD
         /* ── Ayrıştırılmış TSC Telafisi ── */
         preempt_disable();
         local_irq_save(flags);
@@ -445,10 +613,81 @@ int svm_run_guest(struct svm_context *ctx)
         *p_last_rip = current_rip;
 
         vmrun_with_regs(ctx->vmcb_pa, &regs);
+=======
+        /* ── TSC Compensation (runs with IRQs ENABLED — safe, pinned to CPU 0) ── */
+        {
+            u64 host_end = rdtsc();
+            u64 host_processing = host_end - host_start;
+            u64 hw_overhead = 1000;
+
+            s64 refund = (s64)(host_processing + hw_overhead) - (target_cost + jitter);
+            
+            if (refund > 500000LL) refund = 500000LL;
+            if (refund < -500000LL) refund = -500000LL;
+
+            *offset -= refund;
+
+            if (*offset > 10000000000LL) *offset = 10000000000LL;
+            if (*offset < -10000000000LL) *offset = -10000000000LL;
+
+            ctx->vmcb->control.tsc_offset = *offset;
+            ctx->vmcb->control.clean = VMCB_CLEAN_STABLE;
+            
+            *p_last_tsc = rdtsc();
+            *p_last_rip = current_rip;
+        }
+
+        /*
+         * Yield point: Let the kernel process timer interrupts, watchdog,
+         * and other deferred work. Without this, 100k back-to-back VMRUNs
+         * starve interrupts and the watchdog declares a hard lockup.
+         */
+        if ((iter & 511) == 0) {
+            cond_resched();
+            touch_nmi_watchdog();
+        }
+
+        /* ── VMRUN Critical Section (IRQs off for minimum time) ── */
+        kernel_fpu_begin();
+        preempt_disable();
+        local_irq_save(flags);
+
+        asm volatile("mov %%fs, %0" : "=rm"(host_fs_sel));
+        asm volatile("mov %%gs, %0" : "=rm"(host_gs_sel));
+        asm volatile("sldt %0" : "=rm"(host_ldt_sel));
+        
+        host_fs_base        = native_read_msr(MSR_FS_BASE);
+        host_gs_base        = native_read_msr(MSR_GS_BASE);
+        host_kernel_gs_base = native_read_msr(MSR_KERNEL_GS_BASE);
+        host_star           = native_read_msr(MSR_STAR);
+        host_lstar          = native_read_msr(MSR_LSTAR);
+        host_cstar          = native_read_msr(MSR_CSTAR);
+        host_sfmask         = native_read_msr(MSR_SYSCALL_MASK);
+        host_sysenter_cs    = native_read_msr(MSR_IA32_SYSENTER_CS);
+        host_sysenter_esp   = native_read_msr(MSR_IA32_SYSENTER_ESP);
+        host_sysenter_eip   = native_read_msr(MSR_IA32_SYSENTER_EIP);
+
+        vmrun_with_regs(ctx->vmcb_pa, regs);
+
+        asm volatile("lldt %0" :: "rm"(host_ldt_sel));
+
+        native_write_msr(MSR_FS_BASE,          host_fs_base);
+        native_write_msr(MSR_GS_BASE,          host_gs_base);
+        native_write_msr(MSR_KERNEL_GS_BASE,   host_kernel_gs_base);
+        native_write_msr(MSR_STAR,             host_star);
+        native_write_msr(MSR_LSTAR,            host_lstar);
+        native_write_msr(MSR_CSTAR,            host_cstar);
+        native_write_msr(MSR_SYSCALL_MASK,     host_sfmask);
+        native_write_msr(MSR_IA32_SYSENTER_CS, host_sysenter_cs);
+        native_write_msr(MSR_IA32_SYSENTER_ESP,host_sysenter_esp);
+        native_write_msr(MSR_IA32_SYSENTER_EIP,host_sysenter_eip);
+
+>>>>>>> 4f7675a (V6.7 Yarı çözüm)
         host_start = rdtsc();
 
         local_irq_restore(flags);
         preempt_enable();
+<<<<<<< HEAD
     }
 
     pr_err("[VMEXIT] Max iterations (%d) exceeded\n", VMEXIT_MAX_ITERATIONS);
@@ -457,5 +696,19 @@ int svm_run_guest(struct svm_context *ctx)
 out:
     pr_info("[VMEXIT] Exited after %d iterations\n",
             VMEXIT_MAX_ITERATIONS - iter - 1);
+=======
+        kernel_fpu_end();
+    }
+
+    /* 
+     * Hitting max iterations is expected for infinite payloads.
+     * Yielding batch gracefully.
+     */
+    ret = 0;
+
+out:
+    kfree(regs);
+    pr_info("[VMEXIT] Batch complete (%d iterations). Yielding.\n", iter);
+>>>>>>> 4f7675a (V6.7 Yarı çözüm)
     return ret;
 }
