@@ -4,7 +4,9 @@
 [![Arch Linux](https://img.shields.io/badge/OS-Arch%20Linux-1793d1.svg)](https://archlinux.org/)
 [![Status](https://img.shields.io/badge/Status-Production%20NOT%20Ready-success.svg)]()
 
-Dikkat BETA Oldukça fazla açık olabilir. Tested Zen 4. Dikkat gizli triple fault tehlikesi zincirleme risk!
+Kapatılan açık sayısı:79
+
+Dikkat BETA Oldukça fazla açık olabilir. Tested Zen 4. Dikkat gizli triple fault tehlikesi zincirleme risk! 
 
 Dikkat proje eski guvensiz bir surumde takılmıştir triple fault yüzünden denemeyin! 
 
