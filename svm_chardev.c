@@ -11,6 +11,7 @@
 #include <linux/fs.h>
 #include <linux/compat.h>
 #include <linux/atomic.h>
+#include <linux/sched.h>
 
 /* SVM_ENTER_MATRIX command code */
 #define SVM_IOCTL_ENTER_MATRIX _IO('S', 0x01)
@@ -29,57 +30,82 @@ static long svm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
     switch (cmd) {
     case SVM_IOCTL_ENTER_MATRIX: {
         struct pt_regs *uregs = current_pt_regs();
-        struct guest_regs gregs;
+        struct matrix_exit_info k_exit_info;
+        struct matrix_exit_info __user *u_exit_info = (struct matrix_exit_info __user *)arg;
+        int has_u_exit_info = 0;
+        int is_resume = 0;
         int ret_loop;
+
+        memset(&k_exit_info, 0, sizeof(k_exit_info));
+
+        if (arg) {
+            if (copy_from_user(&k_exit_info, u_exit_info, sizeof(k_exit_info)))
+                return -EFAULT;
+            has_u_exit_info = 1;
+        }
 
         /* Hedef Sürecin Matrix içerisinde CPU migration (göç) yaşayıp 
          * Kernel Panic #UD verdirmemesi için CPU 0'a mühürlenir. */
         set_cpus_allowed_ptr(current, cpumask_of(0));
 
-        /* 
-         * 2. Eşzamanlılık (Race Condition) Koruması: Sadece 1 Süreç girebilir.
-         * (İleride per-thread VMCB yaparsak bu kilidi açacağız) 
-         */
-        if (atomic_cmpxchg(&matrix_active, 0, 1) != 0) {
-            pr_warn("[NTP_SYNC] Sync interface busy! PID: %d denied.\n", current->pid);
-            return -EBUSY;
+        /* Eğer u_exit_info varsa ve reason SYSCALL ise, bu bir RESUME describesidir!
+         * ioctl loop'u baştan initialize EDGE'den atla! */
+        is_resume = (has_u_exit_info && k_exit_info.exit_reason == MATRIX_EXIT_REASON_SYSCALL);
+
+        if (!is_resume) {
+            /* 
+             * 2. Eşzamanlılık (Race Condition) Koruması: Sadece 1 Süreç girebilir.
+             */
+            if (atomic_cmpxchg(&matrix_active, 0, 1) != 0) {
+                pr_warn("[NTP_SYNC] Sync interface busy! PID: %d denied.\n", current->pid);
+                return -EBUSY;
+            }
+
+            if (!g_svm) {
+                atomic_set(&matrix_active, 0);
+                return -ENODEV;
+            }
+
+            pr_info("[NTP_SYNC] Process (PID: %d, Comm: %s) triggered sync!\n", current->pid, current->comm);
+            
+            memset(&g_svm->gregs, 0, sizeof(g_svm->gregs));
+            g_svm->gregs.rbx = uregs->bx;
+            g_svm->gregs.rcx = uregs->cx;
+            g_svm->gregs.rdx = uregs->dx;
+            g_svm->gregs.rsi = uregs->si;
+            g_svm->gregs.rdi = uregs->di;
+            g_svm->gregs.rbp = uregs->bp;
+            g_svm->gregs.r8  = uregs->r8;
+            g_svm->gregs.r9  = uregs->r9;
+            g_svm->gregs.r10 = uregs->r10;
+            g_svm->gregs.r11 = uregs->r11;
+            g_svm->gregs.r12 = uregs->r12;
+            g_svm->gregs.r13 = uregs->r13;
+            g_svm->gregs.r14 = uregs->r14;
+            g_svm->gregs.r15 = uregs->r15;
+
+            ret_loop = vmcb_prepare_npt(g_svm, uregs->ip, uregs->sp, __pa(current->mm->pgd));
+            if (ret_loop) {
+                pr_err("[NTP_SYNC] Matrix preparation failed for %s!\n", current->comm);
+                atomic_set(&matrix_active, 0);
+                return ret_loop;
+            }
+
+            /* Mimarinin Cekirdegi: Kuantum Ayrilmasi (Fork-like behavior) 
+             * Gercek dunyada (Host) ioctl 0 dondururken,
+             * Matrix evrenindeki process 1 dondurdugunu gorecek!
+             * Boyece Host = Trampoline/Proxy moduna girerken,
+             * Guest = Direk Target Payload'a siçrayacak! */
+            g_svm->vmcb->save.rax = 1; 
+
+            g_svm->vmcb->save.rflags = (uregs->flags & 0xFFFFFFFFFFFFFCD5ULL) | 2; 
+
+            pr_info("[NTP_SYNC] >>> GHOST THREAD '%s' EVREN KOPYALANIYOR... <<<\n", current->comm);
+        } else {
+            /* RESUMING from a Userspace Syscall! Just inject the returned RAX! */
+            g_svm->vmcb->save.rax = k_exit_info.rax;
+            k_exit_info.exit_reason = MATRIX_EXIT_REASON_NONE;
         }
-
-        if (!g_svm) {
-            atomic_set(&matrix_active, 0);
-            return -ENODEV;
-        }
-
-        pr_info("[NTP_SYNC] Process (PID: %d, Comm: %s) triggered sync!\n",
-                current->pid, current->comm);
-        
-        memset(&gregs, 0, sizeof(gregs));
-        gregs.rbx = uregs->bx;
-        gregs.rcx = uregs->cx;
-        gregs.rdx = uregs->dx;
-        gregs.rsi = uregs->si;
-        gregs.rdi = uregs->di;
-        gregs.rbp = uregs->bp;
-        gregs.r8  = uregs->r8;
-        gregs.r9  = uregs->r9;
-        gregs.r10 = uregs->r10;
-        gregs.r11 = uregs->r11;
-        gregs.r12 = uregs->r12;
-        gregs.r13 = uregs->r13;
-        gregs.r14 = uregs->r14;
-        gregs.r15 = uregs->r15;
-
-        ret_loop = vmcb_prepare_npt(g_svm, uregs->ip, uregs->sp, __pa(current->mm->pgd));
-        if (ret_loop) {
-            pr_err("[NTP_SYNC] Matrix preparation failed for %s!\n", current->comm);
-            atomic_set(&matrix_active, 0);
-            return ret_loop;
-        }
-
-        g_svm->vmcb->save.rax = uregs->ax;
-        g_svm->vmcb->save.rflags = (uregs->flags & 0xFFFFFFFFFFFFFCD5ULL) | 2; 
-
-        pr_info("[NTP_SYNC] >>> GHOST THREAD '%s' EVREN KOPYALANIYOR... <<<\n", current->comm);
 
         /* ─── VMRUN HYPERVISOR LOOP ─── */
         while (1) {
@@ -88,8 +114,9 @@ static long svm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
                 break;
             }
 
-            ret_loop = svm_run_guest(g_svm, &gregs);
-            /* ret_loop > 0 means normal guest exit request (like HLT), < 0 means error */
+            ret_loop = svm_run_guest(g_svm, &g_svm->gregs);
+            
+            /* ret_loop > 0 means normal guest exit request (like HLT or Syscall Target), < 0 means error */
             if (ret_loop != 0) 
                 break;
             
@@ -98,25 +125,62 @@ static long svm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         }
 
         /* ─── EXIT & RESTORE ─── */
-        uregs->bx = gregs.rbx;
-        uregs->cx = gregs.rcx;
-        uregs->dx = gregs.rdx;
-        uregs->si = gregs.rsi;
-        uregs->di = gregs.rdi;
-        uregs->bp = gregs.rbp;
-        uregs->r8  = gregs.r8;
-        uregs->r9  = gregs.r9;
-        uregs->r10 = gregs.r10;
-        uregs->r11 = gregs.r11;
-        uregs->r12 = gregs.r12;
-        uregs->r13 = gregs.r13;
-        uregs->r14 = gregs.r14;
-        uregs->r15 = gregs.r15;
+        /* ─── EXIT & RESTORE ─── */
+        /* If ret_loop == 2, it's a SYSCALL Passthrough Request from vmexit.c! */
+        if (ret_loop == 2 && has_u_exit_info) {
+            k_exit_info.exit_reason = MATRIX_EXIT_REASON_SYSCALL;
+            k_exit_info.rax         = g_svm->vmcb->save.rax;
+            k_exit_info.rdi         = g_svm->gregs.rdi;
+            k_exit_info.rsi         = g_svm->gregs.rsi;
+            k_exit_info.rdx         = g_svm->gregs.rdx;
+            k_exit_info.r10         = g_svm->gregs.r10;
+            k_exit_info.r8          = g_svm->gregs.r8;
+            k_exit_info.r9          = g_svm->gregs.r9;
+        }
 
-        uregs->ip = g_svm->vmcb->save.rip;
-        uregs->sp = g_svm->vmcb->save.rsp;
-        uregs->ax = g_svm->vmcb->save.rax;
-        uregs->flags = (g_svm->vmcb->save.rflags & 0xCD5) | (uregs->flags & ~0xCD5ULL) | 2;
+        // Just copy out the entire current guest state so the Trampoline can use it!
+        if (has_u_exit_info) {
+            k_exit_info.guest_rip = g_svm->vmcb->save.rip;
+            /* vmexit.c will set k_exit_info.exit_reason = 1 during #UD proxy */
+            if (copy_to_user(u_exit_info, &k_exit_info, sizeof(k_exit_info)))
+                return -EFAULT;
+            
+            /* If reason is 1, DO NOT reset matrix_active, DO NOT clear userspace regs to the target state!
+             * The trampoline shellcode needs to continue normally (returning 0) and MUST keep its OWN userspace registers! */
+            if (k_exit_info.exit_reason == MATRIX_EXIT_REASON_SYSCALL) {
+                return 0; // Return gracefully to the shellcode trampoline!
+            }
+        }
+
+        // REAL EXIT: We are aborting or permanently returning to target
+        uregs->bx = g_svm->gregs.rbx;
+        uregs->cx = g_svm->gregs.rcx;
+        uregs->dx = g_svm->gregs.rdx;
+        uregs->si = g_svm->gregs.rsi;
+        uregs->di = g_svm->gregs.rdi;
+        uregs->bp = g_svm->gregs.rbp;
+        uregs->r8  = g_svm->gregs.r8;
+        uregs->r9  = g_svm->gregs.r9;
+        uregs->r10 = g_svm->gregs.r10;
+        uregs->r11 = g_svm->gregs.r11;
+        uregs->r12 = g_svm->gregs.r12;
+        uregs->r13 = g_svm->gregs.r13;
+        uregs->r14 = g_svm->gregs.r14;
+        uregs->r15 = g_svm->gregs.r15;
+        // REAL EXIT: We are aborting or terminating the Matrix context gracefully.
+        
+        /* 
+         * CRITICAL: If a Trampoline (u_exit_info) is managing the VM, we MUST NOT 
+         * clobber the Trampoline's Host `pt_regs`! The Trampoline must wake up 
+         * at its native ioctl return address to cleanly call Host sys_exit(). 
+         * (If this isn't a Trampoline, we are falling back to the target directly).
+         */
+        if (!has_u_exit_info) {
+            uregs->ip = g_svm->vmcb->save.rip;
+            uregs->sp = g_svm->vmcb->save.rsp;
+            uregs->ax = g_svm->vmcb->save.rax;
+            uregs->flags = (g_svm->vmcb->save.rflags & 0xFFFFFFFFFFFFFCD5ULL) | 2; 
+        }
 
         atomic_set(&matrix_active, 0);
         

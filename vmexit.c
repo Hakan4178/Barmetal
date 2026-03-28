@@ -439,40 +439,35 @@ skip_rearm:
         u8 opcode[2] = {0};
         
         /* 
-         * Ghost Target SYSCALL Proxy
-         * EFER.SCE=0 generates #UD for SYSCALL (0x0F 0x05). We emulate critical
-         * syscalls for the 'sleep' target to keep it inside the Matrix forever!
+         * Userspace Micro-Hypervisor Syscall Proxy (Trampoline Passthrough)
+         * EFER.SCE=0 generates #UD for SYSCALL (0x0F 0x05).
          */
         if (copy_from_user(opcode, (void __user *)ctx->vmcb->save.rip, 2) == 0) {
             if (opcode[0] == 0x0F && opcode[1] == 0x05) {
+                /* 
+                 * Raw SYSCALL Instruction Trap!
+                 * We do NOT emulate here. We advance RIP by 2 bytes exactly,
+                 * and return '2' to orchestrate a Userspace Trampoline Proxy pass.
+                 *
+                 * CRITICAL ABI REQUIREMENT: 
+                 * Natively, the 'syscall' hardware instruction clobbers RCX (saves return RIP) 
+                 * and R11 (saves RFLAGS). Because we trap it via #UD *before* hardware execution,
+                 * we MUST emulate this clobbering manually, or glibc will silently crash!
+                 */
                 u64 syscall_nr = ctx->vmcb->save.rax;
                 
-                if (syscall_nr == 3) { /* sys_close */
-                    ctx->vmcb->save.rax = 0; /* Success */
-                    ctx->vmcb->save.rip += 2;
-                    return 0; /* Continue running in Matrix */
-                } 
-                else if (syscall_nr == 35) { /* sys_nanosleep */
-                    struct { u64 tv_sec; u64 tv_nsec; } ts;
-                    if (copy_from_user(&ts, (void __user *)regs->rdi, sizeof(ts)) == 0) {
-                        u64 ms = ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-                        pr_info("[PROXY] Matrix Emülasyon: nanosleep(%llu ms)\n", ms);
-                        msleep(ms); /* Blocking inside kernel module (safe, we are in process context with IRQs on) */
-                    }
-                    ctx->vmcb->save.rax = 0; /* Success */
-                    ctx->vmcb->save.rip += 2;
-                    return 0; /* Continue running in Matrix */
-                } 
-                else if (syscall_nr == 231) { /* sys_exit_group */
-                    pr_info("[PROXY] Hedef exit_group() cagirdi! Matrix'ten ölü olarak atiliyor.\n");
-                    send_sig(SIGKILL, current, 0); /* Cleanly terminate the target process */
-                    return 1; /* Break VMRUN loop, return from ioctl */
+                if (syscall_nr == 60 || syscall_nr == 231) {
+                    pr_info("[PROXY] Hedef exit_group() (%llu) cagirdi! Matrix kapaniyor.\n", syscall_nr);
+                    ret = 1; /* Structural termination of the VMRUN, clears locks gracefully. */
+                    break;
                 }
 
-                /* Fallback for unhandled syscalls */
-                pr_info("[MATRIX_ESCAPE] Proxy desteklemiyor: SYSCALL (NR=%llu) at 0x%llx. Ejecting...\n", 
-                        syscall_nr, ctx->vmcb->save.rip);
-                return 1; /* Graceful exit, let target run natively */
+                regs->rcx = ctx->vmcb->save.rip + 2;
+                regs->r11 = ctx->vmcb->save.rflags;
+
+                ctx->vmcb->save.rip += 2;
+                ret = 2; /* Passthrough to Host Trampoline */
+                break; /* Flow down to Trace / LBR Emission, then gracefully jump to Userspace! */
             }
         }
         
@@ -496,18 +491,27 @@ skip_rearm:
             if (error_code & 2) { /* The #PF was caused by a Write Access, force CoW */
                 if (copy_to_user((void __user *)fault_va, &dummy, 1)) {
                     pr_err("[MATRIX_ESCAPE] CoW Yazma Hatasi at 0x%llx. Ejecting.\n", fault_va);
-                    return 1;
+                    ret = 1;
+                    break;
                 }
             }
             /* Page is now physically backed by Host Kernel. Re-enter VMRUN! */
-            return 0; 
+            ret = 0;
+            break;
         }
         
         /* Real Segmentation Fault / Invalid Memory Access */
         pr_err("[MATRIX_ESCAPE] Fatal #PF at RIP=0x%llx CR2=0x%llx (err=%llx). Ejecting.\n",
                 ctx->vmcb->save.rip, fault_va, error_code);
-        return 1; /* Graceful exit */
+        ret = 1;
+        break; /* Graceful exit with Telemetry */
     }
+
+    case 0x60: /* SVM_EXIT_INTR */
+    case 0x61: /* SVM_EXIT_NMI */
+        /* Host physical interrupt (e.g. Timer tick or Watchdog). Safe exit and loop back! */
+        ret = 0;
+        break;
 
     case SVM_EXIT_EXCP_BASE + 1: {  /* #DB */
         u64 *p_rearm = &ctx->pending_rearm_gpa;

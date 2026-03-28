@@ -135,6 +135,15 @@ int vmcb_prepare_npt(struct svm_context *ctx, u64 g_rip, u64 g_rsp, u64 g_cr3) {
   vmcb->control.intercepts[INTERCEPT_EXCEPTION_OFFSET >> 5] |= (1U << 6);   /* #UD */
   vmcb->control.intercepts[INTERCEPT_EXCEPTION_OFFSET >> 5] |= (1U << 14);  /* #PF */
 
+  /* ── Hardware Interrupt Intercepts (Host Watchdog / Soft-Lockup Protection) ──
+   * V_INTR_MASKING aktifken Host'a gelen fiziksel donanım kesmeleri (Timer, NMI)
+   * doğrudan #VMEXIT (SVM_EXIT_INTR) üretir. Böylece Host sistemi felç olmaz!
+   */
+  vmcb->control.intercepts[INTERCEPT_INTR >> 5] |= (1U << (INTERCEPT_INTR & 31));
+  vmcb->control.intercepts[INTERCEPT_NMI >> 5]  |= (1U << (INTERCEPT_NMI & 31));
+  vmcb->control.intercepts[INTERCEPT_SMI >> 5]  |= (1U << (INTERCEPT_SMI & 31));
+  vmcb->control.int_ctl |= V_INTR_MASKING_MASK;
+
   /* ── MSRPM V5.0: Macro-Based Addressing (AMD APM Vol.2 §15.11) ── */
   if (ctx->msrpm_va) {
     u8 *msrpm = (u8 *)ctx->msrpm_va;

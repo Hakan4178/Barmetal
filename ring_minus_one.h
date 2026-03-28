@@ -133,6 +133,25 @@ struct guest_regs {
 };
 
 /* ═══════════════════════════════════════════════════════════════════════════
+ *  Micro-VMM IPC (Trampoline Passthrough)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+#define MATRIX_EXIT_REASON_NONE    0
+#define MATRIX_EXIT_REASON_SYSCALL 1
+
+struct matrix_exit_info {
+    u64 exit_reason;
+    u64 rax;
+    u64 rdi;
+    u64 rsi;
+    u64 rdx;
+    u64 r10;
+    u64 r8;
+    u64 r9;
+    u64 guest_rip;
+} __attribute__((aligned(64))); /* Cacheline hizali */
+
+/* ═══════════════════════════════════════════════════════════════════════════
  *  Context Structures
  * ═══════════════════════════════════════════════════════════════════════════ */
 
@@ -155,6 +174,9 @@ struct svm_context {
     struct npt_context npt;
     
     u64 pending_rearm_gpa;
+    
+    /* Gerekli: Kapsamdan Cikinca Yok Olmamasi İcin Guest GPR'ler */
+    struct guest_regs gregs;
 };
 
 struct snap_context {
