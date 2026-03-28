@@ -5,7 +5,7 @@
 [![Arch Linux](https://img.shields.io/badge/OS-Arch%20Linux-1793d1.svg)](https://archlinux.org/)
 [![Status](https://img.shields.io/badge/Status-Production%20NOT%20Ready-success.svg)]()
 
-Kapatılan açık sayısı:95
+Kapatılan açık sayısı:97
 
 Dikkat BETA Oldukça fazla açık olabilir. Çok az kaldı.
 
