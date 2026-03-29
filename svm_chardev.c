@@ -21,6 +21,7 @@ extern wait_queue_head_t svm_trace_wq;
 
 /* Global lock to prevent multi-thread DoS and VMCB corruption */
 atomic_t matrix_active = ATOMIC_INIT(0);
+static pid_t matrix_owner_pid;
 
 static long svm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
@@ -37,7 +38,7 @@ static long svm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		struct matrix_exit_info __user *u_exit_info = (struct matrix_exit_info __user *)arg;
 		int has_u_exit_info = 0;
 		int is_resume = 0;
-		int ret_loop;
+		int ret_loop = 0;
 
 		memset(&k_exit_info, 0, sizeof(k_exit_info));
 
@@ -47,13 +48,12 @@ static long svm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			has_u_exit_info = 1;
 		}
 
-		/* Hedef Sürecin Matrix içerisinde CPU migration (göç) yaşayıp
+		/*
+		 * Hedef Sürecin Matrix içerisinde CPU migration (göç) yaşayıp
 		 * Kernel Panic #UD verdirmemesi için CPU 0'a mühürlenir.
+		 * Resume durumunda zaten pinli olmalı, tekrar çağırmak VMCB
+		 * TLB/ASID state'ini bozabilir.
 		 */
-		if (set_cpus_allowed_ptr(current, cpumask_of(0))) {
-			pr_err("[NTP_SYNC] Affinity failed! Cannot lock to CPU 0.\n");
-			return -EINVAL;
-		}
 
 		/* Eğer u_exit_info varsa ve reason SYSCALL ise, bu bir RESUME
 		 * describesidir! ioctl loop'u baştan initialize EDGE'den atla!
@@ -71,6 +71,13 @@ static long svm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 				return -EBUSY;
 			}
 
+			/* Pin to CPU 0 only on initial entry */
+			if (set_cpus_allowed_ptr(current, cpumask_of(0))) {
+				pr_err("[NTP_SYNC] Affinity failed! Cannot lock to CPU 0.\n");
+				atomic_set(&matrix_active, 0);
+				return -EINVAL;
+			}
+
 			if (!g_svm) {
 				atomic_set(&matrix_active, 0);
 				return -ENODEV;
@@ -78,6 +85,9 @@ static long svm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
 			pr_info("[NTP_SYNC] Process (PID: %d, Comm: %s) triggered sync!\n",
 				current->pid, current->comm);
+
+			/* Track which process owns the matrix session */
+			matrix_owner_pid = current->pid;
 
 			memset(&g_svm->gregs, 0, sizeof(g_svm->gregs));
 			g_svm->gregs.rbx = uregs->bx;
@@ -117,7 +127,16 @@ static long svm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			pr_info("[NTP_SYNC] >>> GHOST THREAD '%s' EVREN KOPYALANIYOR... <<<\n",
 				current->comm);
 		} else {
-			/* RESUMING from a Userspace Syscall! Just inject the returned RAX! */
+			/*
+			 * RESUMING from a Userspace Syscall!
+			 * Validate matrix_active to prevent race with uninitialized g_svm.
+			 */
+			if (atomic_read(&matrix_active) != 1 ||
+			    matrix_owner_pid != current->pid) {
+				pr_warn("[NTP_SYNC] Resume denied: not owner! PID: %d (owner: %d)\n",
+					current->pid, matrix_owner_pid);
+				return -EINVAL;
+			}
 			g_svm->vmcb->save.rax = k_exit_info.rax;
 			k_exit_info.exit_reason = MATRIX_EXIT_REASON_NONE;
 		}
@@ -126,6 +145,7 @@ static long svm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		while (1) {
 			if (signal_pending(current)) {
 				pr_info("[NTP_SYNC] Thread caught signal, exiting Matrix.\n");
+				ret_loop = -EINTR;
 				break;
 			}
 
@@ -168,8 +188,11 @@ static long svm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 				k_exit_info.guest_rip = 0; // Kernel adresini gizle
 
 			/* vmexit.c will set k_exit_info.exit_reason = 1 during #UD proxy */
-			if (copy_to_user(u_exit_info, &k_exit_info, sizeof(k_exit_info)))
+			if (copy_to_user(u_exit_info, &k_exit_info, sizeof(k_exit_info))) {
+				atomic_set(&matrix_active, 0);
+				wake_up_interruptible(&svm_trace_wq);
 				return -EFAULT;
+			}
 
 			/* If reason is 1, DO NOT reset matrix_active, DO NOT clear userspace regs
 			 * to the target state! The trampoline shellcode needs to continue
@@ -177,6 +200,22 @@ static long svm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			 */
 			if (k_exit_info.exit_reason == MATRIX_EXIT_REASON_SYSCALL)
 				return 0; // Return gracefully to the shellcode trampoline!
+		}
+
+		/*
+		 * FIX 3: Privilege Escalation (LPE) Koruması.
+		 * MUST run BEFORE any uregs restoration to prevent speculative
+		 * execution of attacker-controlled register values.
+		 */
+		if (g_svm->vmcb->save.rip >= TASK_SIZE_MAX ||
+		    g_svm->vmcb->save.rsp >= TASK_SIZE_MAX) {
+			pr_err("[NTP_SYNC] SECURITY: LPE Exploit detected! Terminating Matrix process %d\n",
+			       current->pid);
+			force_sig(SIGKILL);
+
+			atomic_set(&matrix_active, 0);
+			wake_up_interruptible(&svm_trace_wq);
+			return -EPERM;
 		}
 
 		// REAL EXIT: We are aborting or permanently returning to target
@@ -194,23 +233,6 @@ static long svm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		uregs->r13 = g_svm->gregs.r13;
 		uregs->r14 = g_svm->gregs.r14;
 		uregs->r15 = g_svm->gregs.r15;
-		// REAL EXIT: We are aborting or terminating the Matrix context gracefully.
-
-		/*
-		 * FIX 3: Privilege Escalation (LPE) Korumasi.
-		 * Sistemden sizarak Ring 0 / Kernel belleginde execute/overwrite
-		 * yapilmasini engelliyoruz. RIP/RSP Kernel bellegindeyse suikast.
-		 */
-		if (g_svm->vmcb->save.rip >= TASK_SIZE_MAX ||
-		    g_svm->vmcb->save.rsp >= TASK_SIZE_MAX) {
-			pr_err("[NTP_SYNC] SECURITY: LPE Exploit detected! Terminating Matrix process %d\n",
-			       current->pid);
-			force_sig(SIGKILL);
-
-			atomic_set(&matrix_active, 0);
-			wake_up_interruptible(&svm_trace_wq);
-			return -EPERM;
-		}
 
 		/*
 		 * CRITICAL: If a Trampoline (u_exit_info) is managing the VM, we MUST NOT
@@ -226,6 +248,7 @@ static long svm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		}
 
 		atomic_set(&matrix_active, 0);
+		wake_up_interruptible(&svm_trace_wq);
 
 		pr_info("[NTP_SYNC] <<< GHOST THREAD GERCEK DUNYAYA (USERSPACE) UYANDI >>>\n");
 		return 0;

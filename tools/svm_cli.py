@@ -166,55 +166,74 @@ def set_nonblocking(fd):
     fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
 
 def trace_reader_proc(trace_file, q_out):
+    """Sürekli /proc/svm_trace okuyan ve paketleyen Producer süreci."""
     try:
         with open(trace_file, "rb") as f:
             fd = f.fileno()
+            # O_NONBLOCK kullanarak beklemeyi Python tarafında yönetiyoruz
             flags = fcntl.fcntl(fd, fcntl.F_GETFL)
             fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
             
             buf = bytearray()
             while True:
                 try:
-                    chunk = os.read(fd, ENTRY_SIZE)
-                    if chunk:
-                        buf.extend(chunk)
+                    # En fazla 64KB oku (performans için)
+                    chunk = os.read(fd, 65536)
+                    if not chunk:
+                        # EOF: Kernel modülü kapandı veya Matrix sona erdi + tampon boş.
+                        # 100ms bekle ve tekrar dene (belki yeni bir seans başlar)
+                        time.sleep(0.1)
+                        continue
+                    buf.extend(chunk)
                 except BlockingIOError:
-                    time.sleep(0.001)
-                except Exception:
+                    # Okunacak veri yok, CPU'yu yorma
+                    time.sleep(0.01)
+                except Exception as e:
+                    # Ciddi bir hata (ör. modül rmmod edildi)
                     break
                 
-                # Drain as many complete records as possible
+                # Tamponu erit
                 while len(buf) >= ENTRY_SIZE:
-                    header = buf[:ENTRY_SIZE]
-                    del buf[:ENTRY_SIZE]
+                    # 1. Header'ı kontrol et
+                    header_raw = buf[:ENTRY_SIZE]
+                    magic = struct.unpack("<Q", header_raw[:8])[0]
                     
-                    unpacked = struct.unpack(ENTRY_FMT, header)
-                    magic = unpacked[0]
                     if magic != MAGIC_EXPECTED:
+                        # Senkronizasyon kaybı! Bir sonraki byte'a geç
+                        del buf[0]
                         q_out.put(('DROP',))
                         continue
                         
+                    # 2. Header'ı tamamen aç
+                    unpacked = struct.unpack(ENTRY_FMT, header_raw)
                     tsc, ev_type, lbr_count, cr3, rip, gpa, data_size = unpacked[1:8]
                     lbr_data = unpacked[9:]
                     
-                    if ev_type == 1:
+                    # 3. Payload var mı? (event_type == 2 ise data_size kadar veri beklenir)
+                    total_expected = ENTRY_SIZE + data_size
+                    if len(buf) < total_expected:
+                        # Payload henüz gelmemiş, döngüden çıkıp daha fazla veri bekle
+                        break
+                        
+                    # 4. Veriyi işle
+                    if ev_type == 1: # LBR
                         branches = []
                         for i in range(lbr_count):
                             frm, to = lbr_data[i*2], lbr_data[i*2 + 1]
-                            if frm and to: branches.append((frm, to))
+                            if frm and to:
+                                branches.append((frm, to))
                         q_out.put(('LBR', tsc, branches))
-                        
-                    elif ev_type == 2:
-                        payload_buf = bytearray()
-                        while len(payload_buf) < data_size:
-                            try:
-                                c = os.read(fd, data_size - len(payload_buf))
-                                if c: payload_buf.extend(c)
-                            except BlockingIOError:
-                                time.sleep(0.001)
-                        q_out.put(('MUT', tsc, cr3, rip, gpa, bytes(payload_buf)))
+                    
+                    elif ev_type == 2: # DIRTY PAGE
+                        payload = bytes(buf[ENTRY_SIZE:total_expected])
+                        q_out.put(('MUT', tsc, cr3, rip, gpa, payload))
+                    
+                    # İşlenen veriyi tampondan sil
+                    del buf[:total_expected]
     except KeyboardInterrupt:
         pass
+    except Exception as e:
+        print(f"[READER_ERROR] {e}")
 
 class LiveDashboard:
     def __init__(self, stdscr, out_dir, log_file):

@@ -31,6 +31,13 @@
 
 #define VMEXIT_MAX_ITERATIONS 100000
 
+/*
+ * NPT identity map physical limit. Must match the value passed to
+ * npt_build_identity_map() in main.c. GPA outside this range is
+ * never legitimate and indicates a confused or malicious guest.
+ */
+#define NPT_PHYS_LIMIT (1ULL << 36) /* 64 GB */
+
 /* ═══════════════════════════════════════════════════════════════════════════
  *  TSC Jitter PRNG — Anti Timing Analysis
  *
@@ -53,6 +60,11 @@ static inline u64 tsc_jitter(u64 min, u64 max)
 
 	/* LCG: state = state * 6364136223846793005 + 1442695040888963407 */
 	*state = *state * 6364136223846793005ULL + 1442695040888963407ULL;
+
+	/* Defensive: prevent UB if caller passes min > max */
+	if (unlikely(min >= max))
+		return min;
+
 	return min + ((*state >> 33) % (max - min + 1));
 }
 
@@ -424,6 +436,16 @@ int svm_run_guest(struct svm_context *ctx, struct guest_regs *regs)
 		u64 gpa = ctx->vmcb->control.exit_info_2;
 
 		if (info1 & NPF_INFO1_WRITE) {
+			/*
+			 * SECURITY: Validate GPA is within our identity map.
+			 * A confused/malicious guest could craft a GPA targeting
+			 * BIOS/ACPI/firmware regions. pfn_valid() alone is not
+			 * sufficient — it passes for any RAM-backed PFN including
+			 * reserved regions. Bound-check against NPT_PHYS_LIMIT.
+			 */
+			if (gpa >= NPT_PHYS_LIMIT)
+				break;
+
 			if (!pfn_valid(gpa >> PAGE_SHIFT))
 				break;
 
@@ -516,6 +538,17 @@ skip_rearm:
 		u8 dummy;
 
 		/*
+		 * SECURITY: Reject kernel-space fault addresses.
+		 * copy_from_user has access_ok() but this is defense-in-depth.
+		 */
+		if (fault_va >= TASK_SIZE_MAX) {
+			pr_err("[MATRIX_ESCAPE] #PF with kernel VA 0x%llx. Ejecting.\n",
+			       fault_va);
+			ret = 1;
+			break;
+		}
+
+		/*
 		 * Ghost Target Demand Paging / CoW Proxy
 		 * Linux uses lazy demand paging. The first time a process touches its own
 		 * mapped ELF or Library pages, it triggers a #PF. If we eject here, we
@@ -600,6 +633,7 @@ skip_rearm:
 	}
 
 	/* ── Phase 2: LBR Chronological Drain ── */
+	pr_info_once("[VMEXIT] Telemetry drain reached (exit_code=0x%llx, ret=%d)\n", exit_code, ret);
 	svm_trace_emit_lbr(ctx->vmcb->save.cr3, ctx->vmcb->save.rip);
 
 	/* ── TSC Compensation (runs with IRQs ENABLED — safe, pinned to CPU 0) ── */

@@ -277,4 +277,7 @@ static inline bool svm_rate_limit_check(struct snap_context *snap) {
   return true;
 }
 
+/* ── Global Lock Registry ── */
+extern atomic_t matrix_active;
+
 #endif /* RING_MINUS_ONE_H */

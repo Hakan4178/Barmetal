@@ -28,6 +28,8 @@
 #include "svm_trace.h"
 #include <linux/mutex.h>
 #include <linux/uaccess.h>
+#include <linux/mm.h>
+#include <linux/vmalloc.h>
 
 /* ── Module-level ring instance ────────────────────────────────────────── */
 extern atomic_t matrix_active;
@@ -38,6 +40,7 @@ EXPORT_SYMBOL_GPL(svm_tring);
 
 static DEFINE_MUTEX(trace_read_mutex);
 static DEFINE_RAW_SPINLOCK(trace_write_lock);
+static atomic_t mmap_count = ATOMIC_INIT(0);
 
 /*
  * Wait queue: /proc reader blocks here when the ring is empty.
@@ -136,25 +139,24 @@ void svm_trace_emit_lbr(u64 cr3, u64 rip)
 	u32 i, valid_count = 0;
 	u64 offset;
 
-	/* Bulgu #1: NULL buffer koruması — trace_init başarısız olmuş olabilir */
 	if (unlikely(!svm_tring.buffer))
-		return;
-
-	if (!boot_cpu_has(X86_FEATURE_LBRV))
 		return;
 
 	memset(&hdr, 0, sizeof(hdr));
 	memset(lbr, 0, sizeof(lbr));
 
-	/* Bulgu #3: rdmsrq_safe ile LBR derinliğine güvenli erişim.
-	 * Desteklenmeyen MSR indekslerinde #GP yerine graceful fail.
+	/* 
+	 * Telemetry Resilience: If LBRV is missing (e.g. nested VM), 
+	 * we still emit the header with RIP/CR3 so the user sees progress.
 	 */
-	for (i = 0; i < AMD_LBR_STACK_DEPTH; i++) {
-		if (rdmsrq_safe(MSR_AMD_LBR_FROM_BASE + i, &lbr[i].from))
-			break;
-		if (rdmsrq_safe(MSR_AMD_LBR_TO_BASE + i, &lbr[i].to))
-			break;
-		valid_count++;
+	if (boot_cpu_has(X86_FEATURE_LBRV)) {
+		for (i = 0; i < AMD_LBR_STACK_DEPTH; i++) {
+			if (rdmsrq_safe(MSR_AMD_LBR_FROM_BASE + i, &lbr[i].from))
+				break;
+			if (rdmsrq_safe(MSR_AMD_LBR_TO_BASE + i, &lbr[i].to))
+				break;
+			valid_count++;
+		}
 	}
 
 	hdr.magic = SVM_TRACE_MAGIC;
@@ -167,13 +169,13 @@ void svm_trace_emit_lbr(u64 cr3, u64 rip)
 	hdr.data_size = 0;
 	memcpy(hdr.lbr, lbr, sizeof(lbr));
 
-	/* Bulgu #4: spinlock zaten tam bariyer sağlar, smp_wmb gereksiz kaldırıldı */
 	raw_spin_lock_irqsave(&trace_write_lock, flags);
 	offset = ring_reserve(&svm_tring, sizeof(hdr));
 	ring_write(&svm_tring, offset, &hdr, sizeof(hdr));
 	atomic64_add(sizeof(hdr), &svm_tring.commit_idx);
 	raw_spin_unlock_irqrestore(&trace_write_lock, flags);
 
+	pr_info_once("[SVM_TRACE] First telemetry record (Resilient) emitted to ring buffer.\n");
 	wake_up_interruptible(&svm_trace_wq);
 }
 
@@ -244,6 +246,8 @@ static ssize_t trace_read(struct file *file, char __user *buf, size_t count, lof
 	if (!svm_tring.buffer)
 		return -ENOMEM;
 
+	pr_info_once("[SVM_TRACE] Userspace reader connected to /proc/svm_trace\n");
+
 	mutex_lock(&trace_read_mutex);
 retry:
 	smp_rmb(); /* see all committed writes          */
@@ -263,11 +267,12 @@ retry:
 
 		/*
 		 * MATRIX STATE CHECK (EOF Injection)
-		 * Extrinsic lock mechanism: If Matrix has organically terminated and there
-		 * are no remaining records to consume, signal standard EOF instead of
-		 * deadlocking.
+		 * Only signal EOF if the buffer is empty AND the Matrix session
+		 * is inactive. If committed > consumed, we must allow the
+		 * consumer to drain the remaining evidence!
 		 */
-		if (atomic_read(&matrix_active) == 0) {
+		if (atomic_read(&matrix_active) == 0 &&
+		    (u64)atomic64_read(&svm_tring.commit_idx) == (u64)atomic64_read(&svm_tring.read_idx)) {
 			ret = 0; /* Clean EOF */
 			goto out;
 		}
@@ -305,8 +310,50 @@ out:
 	return ret;
 }
 
+static void trace_mmap_open(struct vm_area_struct *vma)
+{
+	atomic_inc(&mmap_count);
+}
+
+static void trace_mmap_close(struct vm_area_struct *vma)
+{
+	atomic_dec(&mmap_count);
+}
+
+static const struct vm_operations_struct trace_vm_ops = {
+	.open  = trace_mmap_open,
+	.close = trace_mmap_close,
+};
+
+static int trace_mmap(struct file *file, struct vm_area_struct *vma)
+{
+	unsigned long size = vma->vm_end - vma->vm_start;
+
+	if (size > svm_tring.size)
+		return -EINVAL;
+
+	/* SECURITY: Enforce Read-Only mapping. Don't let userspace corrupt the trace ring */
+	if (vma->vm_flags & VM_WRITE)
+		return -EPERM;
+
+	/* Mark VMA to prevent core dumping and paging out */
+	vm_flags_set(vma, VM_DONTEXPAND | VM_DONTDUMP);
+
+	if (remap_vmalloc_range(vma, svm_tring.buffer, 0)) {
+		pr_err("[SVM_TRACE] mmap failed to map trace buffer\n");
+		return -EAGAIN;
+	}
+
+	/* Track active mappings to prevent use-after-free on module unload */
+	vma->vm_ops = &trace_vm_ops;
+	atomic_inc(&mmap_count);
+
+	return 0;
+}
+
 static const struct proc_ops pops_trace = {
 	.proc_read = trace_read,
+	.proc_mmap = trace_mmap,
 };
 
 /* ── Lifecycle ──────────────────────────────────────────────────────────── */
@@ -332,7 +379,8 @@ int svm_trace_init(void)
 		return -ENOMEM;
 	}
 
-	pr_info("[SVM_TRACE] 64 MB ring buffer ready; /proc/svm_trace open\n");
+	pr_info("[SVM_TRACE] 64 MB ring buffer ready; /proc/svm_trace open (LBRV %s)\n",
+		boot_cpu_has(X86_FEATURE_LBRV) ? "Supported" : "NOT Supported (Using Resilience Fallback)");
 	return 0;
 }
 
@@ -342,9 +390,26 @@ void svm_trace_cleanup(void)
 		remove_proc_entry("svm_trace", NULL);
 		proc_trace_entry = NULL;
 	}
+
+	/*
+	 * SECURITY: Guard against use-after-free.
+	 * If any userspace process still holds an mmap reference to our buffer,
+	 * freeing it would create a UAF condition exploitable for LPE.
+	 * Refuse to free and log a critical warning instead.
+	 */
 	if (svm_tring.buffer) {
+		int refs = atomic_read(&mmap_count);
+
 		pr_info("[SVM_TRACE] %lld records dropped over session\n",
 			atomic64_read(&svm_tring.drop_count));
+
+		if (refs > 0) {
+			pr_crit("[SVM_TRACE] REFUSING vfree: %d active mmap refs! Leaking buffer to prevent UAF.\n",
+				refs);
+			svm_tring.buffer = NULL;
+			return;
+		}
+
 		vfree(svm_tring.buffer);
 		svm_tring.buffer = NULL;
 	}

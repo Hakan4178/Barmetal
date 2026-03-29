@@ -26,7 +26,7 @@ MODULE_IMPORT_NS("KVM_AMD");
  */
 
 static struct svm_context svm_ctx = {0};
-static struct snap_context snap_ctx;
+static struct snap_context snap_ctx = {0};
 
 /* Removed: guest_kthread loop */
 
@@ -356,7 +356,10 @@ static int __init svm_module_init(void)
 	/* Phase 3.3 Patch: Pin initialization to CPU 0 to prevent MSR fragmentation
 	 * (#UD invalid opcode on CLGI)
 	 */
-	set_cpus_allowed_ptr(current, cpumask_of(0));
+	if (set_cpus_allowed_ptr(current, cpumask_of(0))) {
+		pr_err("[INIT] Cannot pin to CPU 0 — is it offline?\n");
+		return -ENODEV;
+	}
 
 	pr_info("=== SVM Modülü Başlatılıyor ===\n");
 
@@ -437,19 +440,19 @@ static int __init svm_module_init(void)
 	/* ── Proc entries & Trace Init (MUST BE BEFORE VMRUN) ── */
 	ret = procfs_init(&snap_ctx);
 	if (ret)
-		goto err_msrpm;
+		goto err_iopm;
 
 	ret = svm_trace_init();
 	if (ret) {
 		procfs_exit(&snap_ctx);
-		goto err_msrpm;
+		goto err_iopm;
 	}
 
 	ret = svm_chardev_init();
 	if (ret) {
 		svm_trace_cleanup();
 		procfs_exit(&snap_ctx);
-		goto err_msrpm;
+		goto err_iopm;
 	}
 
 	ret = svm_ghost_init();
@@ -457,12 +460,17 @@ static int __init svm_module_init(void)
 		svm_chardev_exit();
 		svm_trace_cleanup();
 		procfs_exit(&snap_ctx);
-		goto err_msrpm;
+		goto err_iopm;
 	}
 
 	pr_info(">>> BAŞARILI! Modül arka planda sessizce /dev/ntp_sync üzerinden hedef bekliyor <<<\n");
 	return 0;
 
+err_iopm:
+	if (svm_ctx.iopm_va) {
+		free_pages((unsigned long)svm_ctx.iopm_va, 2);
+		svm_ctx.iopm_va = NULL;
+	}
 err_msrpm:
 	if (svm_ctx.msrpm_va) {
 		free_pages((unsigned long)svm_ctx.msrpm_va, 4);
@@ -497,6 +505,15 @@ static void __exit svm_module_exit(void)
 	 * If rmmod runs on CPU 2, CPU 0's MSR is left permanently poisoned.
 	 */
 	set_cpus_allowed_ptr(current, cpumask_of(0));
+
+	/*
+	 * Paranoid: refuse to disable SVM if a guest is still running.
+	 * Module refcount should prevent this, but defense-in-depth.
+	 */
+	if (atomic_read(&matrix_active) != 0) {
+		pr_crit("[EXIT] WARNING: matrix_active != 0 during module unload!\n");
+		atomic_set(&matrix_active, 0);
+	}
 
 	/* Phase 3.1: No kthread cleanup anymore */
 

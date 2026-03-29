@@ -27,27 +27,17 @@ int main() {
     return 1;
   }
 
-  printf(
-      "[PROGRAM] Kirmizi hapi (ioctl) yutuyorum. 1000 saniye uykudayim...\n");
+  while (1) {
+    if (ioctl(fd, SVM_IOCTL_ENTER_MATRIX, 0) < 0)
+      break;
 
-  if (ioctl(fd, SVM_IOCTL_ENTER_MATRIX, 0) < 0) {
-    printf("[PROGRAM] HATA: ioctl cagirisi reddedildi!\n");
-    return 1;
+    /* Perform some work inside the Matrix */
+    native_syscall(SYS_getpid, 0, 0, 0);
+    struct timespec ts = {0, 50000000}; // 50ms
+    native_syscall(SYS_nanosleep, (long)&ts, 0, 0);
   }
 
-  /* ==========================================================
-   * BURADAN ITIBAREN HICBIR KOD GERCEK DUNYADA CALISMIYOR!
-   * HEDEF, HIPERVIZORUN (VMCB) ICINDEDIR.
-   * ==========================================================
-   * Glibc wrapper'i bile kullanmiyoruz cunku arkaplanda gizlice
-   * sys_write veya thread-tracking yapabiliyor! %100 Saf Assembly.
-   */
-
-  native_syscall(SYS_close, fd, 0, 0); /* NR = 3 */
-
-  struct timespec ts = {1000, 0};
-  native_syscall(SYS_nanosleep, (long)&ts, 0, 0); /* NR = 35 */
-
-  native_syscall(SYS_exit_group, 0, 0, 0); /* NR = 231 */
+  printf("[PROGRAM] Matrix seansi bitti.\n");
+  close(fd);
   return 0;
 }
