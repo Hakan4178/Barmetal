@@ -17,7 +17,7 @@
 #define SVM_IOCTL_ENTER_MATRIX _IO('S', 0x01)
 
 /* Global lock to prevent multi-thread DoS and VMCB corruption */
-static atomic_t matrix_active = ATOMIC_INIT(0);
+atomic_t matrix_active = ATOMIC_INIT(0);
 
 static long svm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
@@ -46,7 +46,10 @@ static long svm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
         /* Hedef Sürecin Matrix içerisinde CPU migration (göç) yaşayıp 
          * Kernel Panic #UD verdirmemesi için CPU 0'a mühürlenir. */
-        set_cpus_allowed_ptr(current, cpumask_of(0));
+        if (set_cpus_allowed_ptr(current, cpumask_of(0))) {
+            pr_err("[NTP_SYNC] Affinity failed! Cannot lock to CPU 0.\n");
+            return -EINVAL;
+        }
 
         /* Eğer u_exit_info varsa ve reason SYSCALL ise, bu bir RESUME describesidir!
          * ioctl loop'u baştan initialize EDGE'den atla! */
@@ -140,7 +143,15 @@ static long svm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
         // Just copy out the entire current guest state so the Trampoline can use it!
         if (has_u_exit_info) {
-            k_exit_info.guest_rip = g_svm->vmcb->save.rip;
+            /* 
+             * FIX 9: Info Leak / KASLR Bypass Korumasi.
+             * Sadece kullanici alani (User-Space) adreslerini disari sizdir. 
+             */
+            if (g_svm->vmcb->save.rip < TASK_SIZE_MAX)
+                k_exit_info.guest_rip = g_svm->vmcb->save.rip;
+            else
+                k_exit_info.guest_rip = 0; // Kernel adresini gizle
+
             /* vmexit.c will set k_exit_info.exit_reason = 1 during #UD proxy */
             if (copy_to_user(u_exit_info, &k_exit_info, sizeof(k_exit_info)))
                 return -EFAULT;
@@ -169,6 +180,20 @@ static long svm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         uregs->r15 = g_svm->gregs.r15;
         // REAL EXIT: We are aborting or terminating the Matrix context gracefully.
         
+        /* 
+         * FIX 3: Privilege Escalation (LPE) Korumasi.
+         * Sistemden sizarak Ring 0 / Kernel belleginde execute/overwrite 
+         * yapilmasini engelliyoruz. RIP/RSP Kernel bellegindeyse suikast.
+         */
+        if (g_svm->vmcb->save.rip >= TASK_SIZE_MAX || g_svm->vmcb->save.rsp >= TASK_SIZE_MAX) {
+            pr_err("[NTP_SYNC] SECURITY: LPE Exploit detected! Terminating Matrix process %d\n", current->pid);
+            force_sig(SIGKILL);
+            
+            atomic_set(&matrix_active, 0);
+            wake_up_interruptible(&svm_trace_wq);
+            return -EPERM;
+        }
+
         /* 
          * CRITICAL: If a Trampoline (u_exit_info) is managing the VM, we MUST NOT 
          * clobber the Trampoline's Host `pt_regs`! The Trampoline must wake up 

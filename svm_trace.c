@@ -30,7 +30,11 @@
 #include <linux/mutex.h>
 
 /* ── Module-level ring instance ────────────────────────────────────────── */
+extern atomic_t matrix_active;
+
+/* Lockless Ring Buffer state */
 struct svm_trace_ring svm_tring;
+EXPORT_SYMBOL_GPL(svm_tring);
 
 static DEFINE_MUTEX(trace_read_mutex);
 static DEFINE_RAW_SPINLOCK(trace_write_lock);
@@ -39,7 +43,8 @@ static DEFINE_RAW_SPINLOCK(trace_write_lock);
  * Wait queue: /proc reader blocks here when the ring is empty.
  * Producer calls wake_up_interruptible() after each committed record.
  */
-static DECLARE_WAIT_QUEUE_HEAD(svm_trace_wq);
+DECLARE_WAIT_QUEUE_HEAD(svm_trace_wq);
+EXPORT_SYMBOL_GPL(svm_trace_wq);
 
 static struct proc_dir_entry *proc_trace_entry;
 
@@ -257,12 +262,23 @@ retry:
 			ret = -EAGAIN;
 			goto out;
 		}
+
+		/* 
+		 * MATRIX STATE CHECK (EOF Injection)
+		 * Extrinsic lock mechanism: If Matrix has organically terminated and there are no 
+		 * remaining records to consume, signal standard EOF instead of deadlocking.
+		 */
+		if (atomic_read(&matrix_active) == 0) {
+			ret = 0; /* Clean EOF */
+			goto out;
+		}
 		
 		/* Release mutex before sleeping to prevent deadlocks */
 		mutex_unlock(&trace_read_mutex);
 		if (wait_event_interruptible(svm_trace_wq,
 		    (u64)atomic64_read(&svm_tring.commit_idx) >
-		    (u64)atomic64_read(&svm_tring.read_idx)))
+		    (u64)atomic64_read(&svm_tring.read_idx) ||
+		    atomic_read(&matrix_active) == 0))
 			return -ERESTARTSYS;
 		
 		mutex_lock(&trace_read_mutex);
