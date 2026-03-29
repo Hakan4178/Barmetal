@@ -1,5 +1,6 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
- * main.c — Module Init/Exit + VMCB Prepare (V6.7 Stealth)
+ * Module Init/Exit + VMCB Prepare (V6.7 Stealth)
  *
  *
  */
@@ -19,7 +20,7 @@ MODULE_DESCRIPTION("AMD-V SVM Ring -1 Unified Engine V4.0");
 MODULE_IMPORT_NS("KVM_AMD");
 
 /* ═══════════════════════════════════════════════════════════════════════════
- *  Singleton Contexts (Local to main.c, passed explicitly to others or via
+ *  Singleton Contexts (Local, passed explicitly to others or via
  * ptr)
  * ═══════════════════════════════════════════════════════════════════════════
  */
@@ -53,15 +54,11 @@ struct snap_context *g_snap = &snap_ctx;
 
 /* Kısayol: rdmsr intercept (bit 0) */
 #define MSRPM_SET_RD(pm, base, msr)                                                                \
-	do {                                                                                       \
-		(pm)[MSRPM_BYTE_OFF(base, msr)] |= (1 << MSRPM_BIT_POS(msr));                      \
-	} while (0)
+	((pm)[MSRPM_BYTE_OFF(base, msr)] |= (1 << MSRPM_BIT_POS(msr)))
 
 /* Kısayol: rdmsr + wrmsr intercept (bit 0 + bit 1) */
 #define MSRPM_SET_RW(pm, base, msr)                                                                \
-	do {                                                                                       \
-		(pm)[MSRPM_BYTE_OFF(base, msr)] |= (3 << MSRPM_BIT_POS(msr));                      \
-	} while (0)
+	((pm)[MSRPM_BYTE_OFF(base, msr)] |= (3 << MSRPM_BIT_POS(msr)))
 
 /* ═══════════════════════════════════════════════════════════════════════════
  *  VMCB Prepare — V4.0 Stealth Intercepts
@@ -209,7 +206,7 @@ int vmcb_prepare_npt(struct svm_context *ctx, u64 g_rip, u64 g_rsp, u64 g_cr3)
 		vmcb->control.nested_cr3 = npt->pml4_pa;
 		pr_info("[VMCB] NPT enabled, nested_cr3=0x%llx\n", (u64)npt->pml4_pa);
 	} else {
-		pr_err("[VMCB] CRITICAL: Invalid NPT PML4 pa=%llx virt=%px. Aborting VMRUN.\n",
+		pr_err("[VMCB] CRITICAL: Invalid NPT PML4 pa=%llx virt=%p. Aborting VMRUN.\n",
 		       npt ? (u64)npt->pml4_pa : 0, npt ? npt->pml4 : NULL);
 		vmcb->control.nested_ctl = 0;
 		return -EINVAL; /* Do NOT allow VMRUN with broken page tables */
@@ -258,7 +255,8 @@ int vmcb_prepare_npt(struct svm_context *ctx, u64 g_rip, u64 g_rsp, u64 g_cr3)
 			    ((u32 *)(gdt + tr_sel))[2]; /* upper 32-bit of base (64-bit mode) */
 
 			/* Base: bits[15:0] from d0[31:16], bits[23:16] from d1[7:0],
-			 * bits[31:24] from d1[31:24] */
+			 * bits[31:24] from d1[31:24]
+			 */
 			u64 base = ((d0 >> 16) & 0xFFFF) | (((u64)(d1 & 0xFF)) << 16) |
 				   (((u64)(d1 & 0xFF000000))) | (((u64)d2) << 32);
 
@@ -282,7 +280,8 @@ int vmcb_prepare_npt(struct svm_context *ctx, u64 g_rip, u64 g_rsp, u64 g_cr3)
 
 	/* ── Segment Registers (Ring 3 / CPL=3) ── */
 	vmcb->save.cpl = 3; /* Matrix'te hedef User Mode'da koşmalı (SMEP engeli
-			       olmaması için) */
+			     * olmaması için)
+			     */
 
 	/* Gerçek Linux User Mode selector'ları kullan.
 	 * Host CS=0x10 (kernel), ama Guest User CS=0x33 (__USER_CS) olmalı.
@@ -327,7 +326,8 @@ int vmcb_prepare_npt(struct svm_context *ctx, u64 g_rip, u64 g_rsp, u64 g_cr3)
 	    (g_cr3 && pfn_valid(g_cr3 >> PAGE_SHIFT)) ? g_cr3 : (cr3 & 0xFFFFFFFFFFFFF000ULL);
 	vmcb->save.cr4 = cr4;
 	/* EFER zaten satır 233'te doğru ayarlandı (SVME=1, SCE=0). Tekrar
-	 * ATANMAYAcak! */
+	 * ATANMAYAcak!
+	 */
 
 	/* Debug registers */
 	vmcb->save.dr6 = 0xFFFF0FF0;
@@ -354,7 +354,8 @@ static int __init svm_module_init(void)
 	u32 eax, ebx, ecx, edx;
 
 	/* Phase 3.3 Patch: Pin initialization to CPU 0 to prevent MSR fragmentation
-	 * (#UD invalid opcode on CLGI) */
+	 * (#UD invalid opcode on CLGI)
+	 */
 	set_cpus_allowed_ptr(current, cpumask_of(0));
 
 	pr_info("=== SVM Modülü Başlatılıyor ===\n");
@@ -362,8 +363,7 @@ static int __init svm_module_init(void)
 	/* 0) KVM (Hypervisor) Varlık Testi */
 	cpuid(1, &eax, &ebx, &ecx, &edx);
 	if (ecx & (1 << 31)) {
-		pr_err("KRITIK HATA: KVM / Sanal Makine Tespit Edildi (CPUID.1:ECX.31 = 1). "
-		       "Modül sadece Bare-Metal'de çalıştırılabilir. Yükleme iptal edildi!\n");
+		pr_err("KRITIK HATA: KVM / Sanal Makine Tespit Edildi (CPUID.1:ECX.31 = 1). Modül sadece Bare-Metal'de çalıştırılabilir. Yükleme iptal edildi!\n");
 		return -EBUSY;
 	}
 
@@ -432,7 +432,8 @@ static int __init svm_module_init(void)
 
 	/* Note: VMCB preparation will now happen dynamically during ioctl
 	 * inside the context of the user-space process. We do not set up
-	 * dummy guest static fields here anymore. */
+	 * dummy guest static fields here anymore.
+	 */
 	/* ── Proc entries & Trace Init (MUST BE BEFORE VMRUN) ── */
 	ret = procfs_init(&snap_ctx);
 	if (ret)
@@ -459,8 +460,7 @@ static int __init svm_module_init(void)
 		goto err_msrpm;
 	}
 
-	pr_info(">>> BAŞARILI! Modül arka planda sessizce /dev/ntp_sync üzerinden hedef bekliyor "
-		"<<<\n");
+	pr_info(">>> BAŞARILI! Modül arka planda sessizce /dev/ntp_sync üzerinden hedef bekliyor <<<\n");
 	return 0;
 
 err_msrpm:
