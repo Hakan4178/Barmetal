@@ -5,7 +5,7 @@ KDIR := /lib/modules/$(shell uname -r)/build
 PWD  := $(shell pwd)
 
 obj-m += ring_minus_one.o
-ring_minus_one-objs := main.o vmexit.o svm_dump.o npt_walk.o svm_trace.o svm_engine.o tsc_stealth.o svm_chardev.o svm_ghost.o svm_asm.o
+ring_minus_one-objs := main.o vmexit.o svm_dump.o npt_walk.o svm_trace.o svm_engine.o tsc_stealth.o svm_chardev.o svm_ghost.o svm_asm.o svm_spoof.o svm_npt_hook.o
 
 # ─── Sertleştirilmiş Derleyici Bayrakları ───
 # -Werror           : Tüm uyarılar hata olarak ele alınır

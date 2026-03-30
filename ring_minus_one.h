@@ -257,4 +257,17 @@ static inline bool svm_rate_limit_check(struct snap_context *snap) {
 /* ── Global Lock Registry ── */
 extern atomic_t matrix_active;
 
+/* [PHASE 16 ELSE] Native Syscall Spoofing Fallback */
+int init_syscall_spoofing(void);
+void cleanup_syscall_spoofing(void);
+
+/* [PHASE 18 IF] Surgical NPT Hooking Engine */
+#define NPT_WATCH_NX  (1U << 0)
+#define NPT_WATCH_RO  (1U << 1)
+int npt_hook_init(void);
+void npt_hook_exit(void);
+int npt_hook_add_watch(struct npt_context *ctx, u64 gpa_start, u64 gpa_end, u32 flags);
+int npt_hook_remove_watch(struct npt_context *ctx, u64 gpa_start);
+u32 npt_hook_is_watched(u64 gpa);
+
 #endif /* RING_MINUS_ONE_H */

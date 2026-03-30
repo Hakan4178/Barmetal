@@ -1,0 +1,339 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Phase 18 — Surgical NPT Hooking Engine
+ *
+ * VMP gibi koruma sistemleri, şifreli (.vmp0/.vmp1) section'ları çalışma
+ * zamanında açar (decrypt) ve ardından CPU'ya execute ettirir. Biz bu
+ * "açılma" anını NPT (Nested Page Table) üzerinden NX (No-Execute) trap
+ * ile cerrahi olarak yakalıyoruz.
+ *
+ * Mimari:
+ *   1. Kullanıcı, izlemek istediği GPA (Guest Physical Address) aralığını
+ *      procfs üzerinden kaydeder.
+ *   2. Bu sayfalar NPT'de NX olarak işaretlenir.
+ *   3. Guest bu sayfada kod çalıştırmaya kalktığında #NPF (Execute Fault)
+ *      üretilir.
+ *   4. Handler, olayı svm_trace ring buffer'a yazar, sayfayı geçici olarak
+ *      executable yapar, TF (Trap Flag) ile tek adım atar, #DB'de tekrar
+ *      NX'e çeker. (Write-Protect ile aynı MTF taktiği)
+ *
+ * Bu sayede:
+ *   - Sadece İZLENEN sayfalar VMExit üretir (VMExit Storm yok)
+ *   - VMP'nin açtığı her kod sayfası anında loglanır
+ *   - Performans etkisi sadece hedeflenen bölgelerle sınırlıdır
+ */
+
+#include "ring_minus_one.h"
+#include "svm_trace.h"
+#include <linux/proc_fs.h>
+#include <linux/seq_file.h>
+#include <linux/uaccess.h>
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ *  Watchlist — Cerrahi Hedef Listesi
+ *  Maksimum 64 bölge izlenebilir. Her bölge bir GPA aralığıdır.
+ *  Aralık, 2MB sınırlarına hizalanır (NPT PD seviyesi).
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
+
+#define NPT_HOOK_MAX_WATCHES 64
+
+struct npt_watch_entry {
+	u64 gpa_start;    /* 2MB-aligned başlangıç GPA */
+	u64 gpa_end;      /* 2MB-aligned bitiş GPA (exclusive) */
+	u32 flags;        /* NPT_WATCH_NX | NPT_WATCH_RO */
+	bool active;
+};
+
+#define NPT_WATCH_NX  (1U << 0)  /* Execute trap (VMP decrypt izleme) */
+#define NPT_WATCH_RO  (1U << 1)  /* Write trap (Dirty page izleme) */
+
+static struct npt_watch_entry watch_table[NPT_HOOK_MAX_WATCHES];
+static int watch_count;
+static DEFINE_SPINLOCK(watch_lock);
+
+/* ── Procfs entry ── */
+static struct proc_dir_entry *hook_proc_entry;
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ *  Watchlist API — Kernel-internal
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
+
+/*
+ * npt_hook_add_watch - Belirtilen GPA aralığını izleme listesine ekle
+ * @ctx: NPT context (sayfa tablosu değişiklikleri için)
+ * @gpa_start: İzlenecek bölgenin başlangıç adresi
+ * @gpa_end: İzlenecek bölgenin bitiş adresi (exclusive)
+ * @flags: NPT_WATCH_NX ve/veya NPT_WATCH_RO
+ *
+ * Returns: 0 on success, -ENOSPC if table full, -EINVAL if bad params
+ */
+int npt_hook_add_watch(struct npt_context *ctx, u64 gpa_start, u64 gpa_end, u32 flags)
+{
+	unsigned long irqflags;
+	int i, slot = -1;
+	u64 gpa;
+
+	if (!ctx || !ctx->pml4 || gpa_start >= gpa_end)
+		return -EINVAL;
+
+	/* 2MB hizalama */
+	gpa_start &= ~((2ULL << 20) - 1);
+	gpa_end = ALIGN(gpa_end, 2ULL << 20);
+
+	spin_lock_irqsave(&watch_lock, irqflags);
+
+	/* Duplicate kontrolü */
+	for (i = 0; i < NPT_HOOK_MAX_WATCHES; i++) {
+		if (watch_table[i].active &&
+		    watch_table[i].gpa_start == gpa_start &&
+		    watch_table[i].gpa_end == gpa_end) {
+			spin_unlock_irqrestore(&watch_lock, irqflags);
+			return 0; /* Zaten izleniyor */
+		}
+		if (!watch_table[i].active && slot < 0)
+			slot = i;
+	}
+
+	if (slot < 0) {
+		spin_unlock_irqrestore(&watch_lock, irqflags);
+		return -ENOSPC;
+	}
+
+	watch_table[slot].gpa_start = gpa_start;
+	watch_table[slot].gpa_end = gpa_end;
+	watch_table[slot].flags = flags;
+	watch_table[slot].active = true;
+	watch_count++;
+
+	spin_unlock_irqrestore(&watch_lock, irqflags);
+
+	/* NPT sayfalarını işaretle */
+	for (gpa = gpa_start; gpa < gpa_end; gpa += (2ULL << 20)) {
+		if (flags & NPT_WATCH_NX)
+			npt_set_page_nx(ctx, gpa);
+		if (flags & NPT_WATCH_RO)
+			npt_set_page_ro(ctx, gpa);
+	}
+
+	pr_info("[NPT_HOOK] Watch added: GPA 0x%llx-0x%llx flags=0x%x\n",
+		gpa_start, gpa_end, flags);
+	return 0;
+}
+
+/*
+ * npt_hook_remove_watch - İzleme listesinden kaldır ve NPT'yi geri al
+ */
+int npt_hook_remove_watch(struct npt_context *ctx, u64 gpa_start)
+{
+	unsigned long irqflags;
+	int i;
+	u64 gpa;
+
+	gpa_start &= ~((2ULL << 20) - 1);
+
+	spin_lock_irqsave(&watch_lock, irqflags);
+
+	for (i = 0; i < NPT_HOOK_MAX_WATCHES; i++) {
+		if (watch_table[i].active && watch_table[i].gpa_start == gpa_start) {
+			struct npt_watch_entry *w = &watch_table[i];
+
+			/* NPT'yi geri al */
+			for (gpa = w->gpa_start; gpa < w->gpa_end; gpa += (2ULL << 20))
+				npt_set_page_rw(ctx, gpa);
+
+			w->active = false;
+			watch_count--;
+
+			spin_unlock_irqrestore(&watch_lock, irqflags);
+			pr_info("[NPT_HOOK] Watch removed: GPA 0x%llx\n", gpa_start);
+			return 0;
+		}
+	}
+
+	spin_unlock_irqrestore(&watch_lock, irqflags);
+	return -ENOENT;
+}
+
+/*
+ * npt_hook_is_watched - Verilen GPA, izleme listesinde mi?
+ * VMEXIT handler'ından çağrılır (IRQ disabled, çok hızlı olmalı).
+ * Returns: flags (NPT_WATCH_NX | NPT_WATCH_RO) or 0 if not watched.
+ */
+u32 npt_hook_is_watched(u64 gpa)
+{
+	int i;
+
+	/* Hot path — lock almıyoruz, watch_table'ı sadece modül init'te
+	 * ve procfs'ten yazarız, VMEXIT path'inde sadece okuruz.
+	 * Worst case: bir kayıt kaçırırız, bu kabul edilebilir.
+	 */
+	for (i = 0; i < NPT_HOOK_MAX_WATCHES; i++) {
+		if (watch_table[i].active &&
+		    gpa >= watch_table[i].gpa_start &&
+		    gpa < watch_table[i].gpa_end)
+			return watch_table[i].flags;
+	}
+	return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ *  Procfs Interface: /proc/svm_npt_hook
+ *
+ *  Komutlar:
+ *    echo "add <gpa_start_hex> <gpa_end_hex> <nx|ro|nxro>" > /proc/svm_npt_hook
+ *    echo "del <gpa_start_hex>" > /proc/svm_npt_hook
+ *    echo "clear" > /proc/svm_npt_hook
+ *    cat /proc/svm_npt_hook   → aktif izleme listesini gösterir
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
+
+static int hook_proc_show(struct seq_file *m, void *v)
+{
+	int i;
+	unsigned long irqflags;
+
+	seq_printf(m, "=== NPT Surgical Hook Watchlist (%d/%d) ===\n",
+		   watch_count, NPT_HOOK_MAX_WATCHES);
+	seq_printf(m, "%-4s %-18s %-18s %-8s\n", "ID", "GPA_START", "GPA_END", "FLAGS");
+	seq_puts(m, "---- ------------------ ------------------ --------\n");
+
+	spin_lock_irqsave(&watch_lock, irqflags);
+	for (i = 0; i < NPT_HOOK_MAX_WATCHES; i++) {
+		if (!watch_table[i].active)
+			continue;
+		seq_printf(m, "%-4d 0x%016llx 0x%016llx %s%s\n",
+			   i,
+			   watch_table[i].gpa_start,
+			   watch_table[i].gpa_end,
+			   (watch_table[i].flags & NPT_WATCH_NX) ? "NX " : "",
+			   (watch_table[i].flags & NPT_WATCH_RO) ? "RO" : "");
+	}
+	spin_unlock_irqrestore(&watch_lock, irqflags);
+
+	return 0;
+}
+
+static int hook_proc_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, hook_proc_show, NULL);
+}
+
+static ssize_t hook_proc_write(struct file *file, const char __user *buf,
+			       size_t count, loff_t *ppos)
+{
+	char kbuf[128];
+	size_t len = min(count, sizeof(kbuf) - 1);
+	u64 gpa_start, gpa_end;
+	char flag_str[16];
+	u32 flags = 0;
+
+	if (!g_svm)
+		return -ENODEV;
+
+	if (copy_from_user(kbuf, buf, len))
+		return -EFAULT;
+	kbuf[len] = '\0';
+
+	if (strncmp(kbuf, "add ", 4) == 0) {
+		if (sscanf(kbuf + 4, "%llx %llx %15s", &gpa_start, &gpa_end, flag_str) != 3)
+			return -EINVAL;
+
+		if (strstr(flag_str, "nx"))
+			flags |= NPT_WATCH_NX;
+		if (strstr(flag_str, "ro"))
+			flags |= NPT_WATCH_RO;
+		if (!flags)
+			return -EINVAL;
+
+		if (npt_hook_add_watch(&g_svm->npt, gpa_start, gpa_end, flags))
+			return -ENOMEM;
+
+	} else if (strncmp(kbuf, "del ", 4) == 0) {
+		if (sscanf(kbuf + 4, "%llx", &gpa_start) != 1)
+			return -EINVAL;
+
+		if (npt_hook_remove_watch(&g_svm->npt, gpa_start))
+			return -ENOENT;
+
+	} else if (strncmp(kbuf, "clear", 5) == 0) {
+		int i;
+		unsigned long irqflags;
+
+		spin_lock_irqsave(&watch_lock, irqflags);
+		for (i = 0; i < NPT_HOOK_MAX_WATCHES; i++) {
+			if (watch_table[i].active) {
+				u64 gpa;
+
+				for (gpa = watch_table[i].gpa_start;
+				     gpa < watch_table[i].gpa_end;
+				     gpa += (2ULL << 20))
+					npt_set_page_rw(&g_svm->npt, gpa);
+
+				watch_table[i].active = false;
+			}
+		}
+		watch_count = 0;
+		spin_unlock_irqrestore(&watch_lock, irqflags);
+		pr_info("[NPT_HOOK] All watches cleared.\n");
+	} else {
+		return -EINVAL;
+	}
+
+	return count;
+}
+
+static const struct proc_ops hook_proc_ops = {
+	.proc_open    = hook_proc_open,
+	.proc_read    = seq_read,
+	.proc_write   = hook_proc_write,
+	.proc_lseek   = seq_lseek,
+	.proc_release = single_release,
+};
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ *  Module Init / Exit
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
+
+int npt_hook_init(void)
+{
+	memset(watch_table, 0, sizeof(watch_table));
+	watch_count = 0;
+
+	hook_proc_entry = proc_create("svm_npt_hook", 0600, NULL, &hook_proc_ops);
+	if (!hook_proc_entry) {
+		pr_err("[NPT_HOOK] Failed to create /proc/svm_npt_hook\n");
+		return -ENOMEM;
+	}
+
+	pr_info("[NPT_HOOK] Phase 18 Surgical NPT Hooking Engine initialized.\n");
+	return 0;
+}
+
+void npt_hook_exit(void)
+{
+	if (hook_proc_entry) {
+		proc_remove(hook_proc_entry);
+		hook_proc_entry = NULL;
+	}
+
+	/* Tüm izlemeleri kaldır */
+	if (g_svm) {
+		int i;
+
+		for (i = 0; i < NPT_HOOK_MAX_WATCHES; i++) {
+			if (watch_table[i].active) {
+				u64 gpa;
+
+				for (gpa = watch_table[i].gpa_start;
+				     gpa < watch_table[i].gpa_end;
+				     gpa += (2ULL << 20))
+					npt_set_page_rw(&g_svm->npt, gpa);
+			}
+		}
+	}
+
+	pr_info("[NPT_HOOK] Phase 18 cleanup done.\n");
+}

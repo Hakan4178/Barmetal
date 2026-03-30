@@ -60,6 +60,10 @@ struct snap_context *g_snap = &snap_ctx;
 #define MSRPM_SET_RW(pm, base, msr)                                                                \
 	((pm)[MSRPM_BYTE_OFF(base, msr)] |= (3 << MSRPM_BIT_POS(msr)))
 
+/* Kısayol: sadece wrmsr intercept (bit 1) — Phase 19: Thread doğumu */
+#define MSRPM_SET_WR(pm, base, msr)                                                                \
+	((pm)[MSRPM_BYTE_OFF(base, msr)] |= (1 << (MSRPM_BIT_POS(msr) + 1)))
+
 /* ═══════════════════════════════════════════════════════════════════════════
  *  VMCB Prepare — V4.0 Stealth Intercepts
  * ═══════════════════════════════════════════════════════════════════════════
@@ -152,7 +156,6 @@ int vmcb_prepare_npt(struct svm_context *ctx, u64 g_rip, u64 g_rsp, u64 g_cr3)
 		MSRPM_SET_RD(msrpm, MSRPM_BASE_LOW, 0xE7);  /* IA32_MPERF: rdmsr */
 		MSRPM_SET_RD(msrpm, MSRPM_BASE_LOW, 0xE8);  /* IA32_APERF: rdmsr */
 		MSRPM_SET_RD(msrpm, MSRPM_BASE_LOW, 0x176); /* IA32_SYSENTER_EIP: rdmsr */
-		MSRPM_SET_RW(msrpm, MSRPM_BASE_LOW, 0x1D9); /* IA32_DEBUGCTL: rd+wr (BTS block) */
 		MSRPM_SET_RD(msrpm, MSRPM_BASE_LOW, 0x309); /* IA32_FIXED_CTR0: rdmsr */
 		MSRPM_SET_RD(msrpm, MSRPM_BASE_LOW, 0x30A); /* IA32_FIXED_CTR1: rdmsr */
 		MSRPM_SET_RD(msrpm, MSRPM_BASE_LOW, 0x30B); /* IA32_FIXED_CTR2: rdmsr */
@@ -163,6 +166,16 @@ int vmcb_prepare_npt(struct svm_context *ctx, u64 g_rip, u64 g_rsp, u64 g_cr3)
 		MSRPM_SET_RW(msrpm, MSRPM_BASE_C000, 0x81);  /* STAR: rd+wr */
 		MSRPM_SET_RW(msrpm, MSRPM_BASE_C000, 0x82);  /* LSTAR: rd+wr */
 		MSRPM_SET_RD(msrpm, MSRPM_BASE_C000, 0x103); /* TSC_AUX: rdmsr */
+
+		/*
+		 * [PHASE 19] Thread Doğumu Tespiti (Pure VMI)
+		 * OS yeni thread için TLS ayarlarken WRMSR FS/GS_BASE yazar.
+		 * Sadece WRITE intercept: Guest okuma yapabilir (stealth).
+		 * SWAPGS de GS_BASE değiştirdiği için kernel geçişleri de yakalanır.
+		 */
+		MSRPM_SET_WR(msrpm, MSRPM_BASE_C000, 0x100); /* MSR_FS_BASE (0xC0000100): wr */
+		MSRPM_SET_WR(msrpm, MSRPM_BASE_C000, 0x101); /* MSR_GS_BASE (0xC0000101): wr */
+		MSRPM_SET_WR(msrpm, MSRPM_BASE_C000, 0x102); /* MSR_KERNEL_GS_BASE (0xC0000102): wr */
 
 		/* ── Bölge 2: MSR 0xC001xxxx ── */
 		MSRPM_SET_RD(msrpm, MSRPM_BASE_C001,
@@ -197,13 +210,13 @@ int vmcb_prepare_npt(struct svm_context *ctx, u64 g_rip, u64 g_rsp, u64 g_cr3)
 	vmcb->control.virt_ext |= LBR_CTL_ENABLE_MASK; // LBR Virtualization (save/restore)
 
 	/*
-	 * Enable actual LBR recording in the guest.
-	 * LBRV alone only saves/restores LBR state on VMRUN/VMEXIT.
-	 * We must also set DBGCTL.LBR (bit 0) to start branch recording.
-	 * After VMEXIT, br_from/br_to in the VMCB save area will contain
-	 * the guest's last branch taken before the exit.
+	 * Phase 17 (LBR Illusion): LBR recording NO LONGER forced.
+	 * If we force DBGCTL.LBR (bit 0) to 1, Anti-Cheats (VMP/EAC) reading 
+	 * MSR_DEBUGCTL (0x1D9) will detect the anomaly and ban the user.
+	 * LBR Virtualization handles everything natively. The guest remains blind.
 	 */
-	vmcb->save.dbgctl = 1; /* LBR enable */
+	rdmsrl(0x1D9, msr_val);
+	vmcb->save.dbgctl = msr_val & 0xFFFFFFFE; /* Disable LBR trace securely */
 
 	/* First VMRUN: clean=0 forces full load. Subsequent runs use STABLE. */
 	vmcb->control.clean = 0;
@@ -243,7 +256,7 @@ int vmcb_prepare_npt(struct svm_context *ctx, u64 g_rip, u64 g_rsp, u64 g_cr3)
 	/* EFER Register - SVME Enable and Disable SCE (SYSCALL) to catch transitions
 	 */
 	rdmsrl(MSR_EFER, msr_val);
-	vmcb->save.efer = (msr_val | EFER_SVME) & ~EFER_SCE;
+	vmcb->save.efer = (msr_val | EFER_SVME);
 
 	/* TR (Task Register) - Triple Fault Fix (Security Fix #3)
 	 * 64-bit TSS descriptor = 16 byte (desc[0..3]), Intel/AMD SDM Vol.3 §7.2.3
@@ -472,6 +485,16 @@ static int __init svm_module_init(void)
 		goto err_iopm;
 	}
 
+	ret = init_syscall_spoofing();
+	if (ret) {
+		pr_warn("[RING-1] Kprobe Spoofing failed to init. Running without Phase 16 Fallback.\n");
+	}
+
+	ret = npt_hook_init();
+	if (ret) {
+		pr_warn("[RING-1] NPT Hook Engine failed to init. Running without Phase 18.\n");
+	}
+
 	pr_info(">>> BAŞARILI! Modül arka planda sessizce /dev/ntp_sync üzerinden hedef bekliyor <<<\n");
 	return 0;
 
@@ -526,6 +549,8 @@ static void __exit svm_module_exit(void)
 
 	/* Phase 3.1: No kthread cleanup anymore */
 
+	npt_hook_exit();
+	cleanup_syscall_spoofing();
 	svm_ghost_exit();
 	svm_chardev_exit();
 	svm_trace_cleanup();

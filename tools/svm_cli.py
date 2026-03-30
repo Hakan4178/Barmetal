@@ -52,40 +52,40 @@ def extract_dump(output_file):
     print("[*] RAM okunuyor (Ring -1 Belleği)...")
     try:
         with open(input_file, "rb") as f:
-            raw_data = f.read()
+            header = f.read(HEADER_SIZE)
+            if len(header) < HEADER_SIZE:
+                print("[!] Geçersiz snapshot boyutu.")
+                return
+
+            magic, version, pid, flags, ts, cr3, vma_count, map_count, total_size, checksum = struct.unpack_from(HEADER_FMT, header, 0)
+            
+            if magic != b'SVMD':
+                print("[!] HATA: Büyülü imza bulunamadı (SVMD).")
+                return
+
+            print(f"\n[+] Snapshot Bilgileri:")
+            print(f"    - Modül Versiyon: {version}")
+            print(f"    - Hedef PID     : {pid}")
+            print(f"    - Kernel CR3    : 0x{cr3:016x}")
+            print(f"    - VMA Sayısı    : {vma_count}")
+            print(f"    - Toplam Alan   : {total_size / (1024*1024):.2f} MB")
+
+            f.seek(0)
+            with open(output_file, "wb") as out:
+                remaining = total_size
+                while remaining > 0:
+                    chunk_size = min(1024*1024, remaining)
+                    chunk = f.read(chunk_size)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    remaining -= len(chunk)
+                    
+            print(f"\n[+] Snapshot başarıyla diske kaydedildi: {output_file}")
     except Exception as e:
-        print(f"[!] Veri okunamadı: {e}")
-        return
+        print(f"[!] Veri işlemi başarsız: {e}")
 
-    if len(raw_data) < HEADER_SIZE:
-        print("[!] Geçersiz snapshot boyutu.")
-        return
 
-    magic, version, pid, flags, ts, cr3, vma_count, map_count, total_size, checksum = struct.unpack_from(HEADER_FMT, raw_data, 0)
-    
-    if magic != b'SVMD':
-        print("[!] HATA: Büyülü imza bulunamadı (SVMD).")
-        return
-
-    print(f"\n[+] Snapshot Bilgileri:")
-    print(f"    - Modül Versiyon: {version}")
-    print(f"    - Hedef PID     : {pid}")
-    print(f"    - Kernel CR3    : 0x{cr3:016x}")
-    print(f"    - VMA Sayısı    : {vma_count}")
-    print(f"    - Toplam Alan   : {total_size / (1024*1024):.2f} MB")
-
-    ok, comp = verify_checksum(raw_data, total_size, checksum)
-    if ok:
-        print("    - Integrity   : [OK] Sağlam")
-    else:
-        print(f"    - Integrity   : [FAIL] Checksum Uyuşmazlığı! Istenen: {checksum:x}, Hesaplanan: {comp:x}")
-
-    try:
-        with open(output_file, "wb") as f:
-            f.write(raw_data[:total_size])
-        print(f"\n[+] Snapshot başarıyla diske kaydedildi: {output_file}")
-    except Exception as e:
-        print(f"[!] Dosya yazılamadı: {e}")
 
 def write_proc(name, val):
     try:
@@ -167,6 +167,46 @@ def set_nonblocking(fd):
     flags = fcntl.fcntl(fd, fcntl.F_GETFL)
     fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
 
+class CircularBuffer:
+    """Zero-copy sliding window buffer"""
+    def __init__(self, max_size=1024*1024):
+        self.data = bytearray(max_size)
+        self.read_pos = 0
+        self.write_pos = 0
+    
+    def append(self, chunk):
+        chunk_len = len(chunk)
+        if self.write_pos + chunk_len > len(self.data):
+            # Try to compact first if we run out of capacity
+            self.compact()
+            # If still not enough, then just let the memoryview fail or ideally resize buffer
+            # We'll reallocate if it's too big
+            if self.write_pos + chunk_len > len(self.data):
+                self.data.extend(bytearray(chunk_len))
+                
+        self.data[self.write_pos:self.write_pos + chunk_len] = chunk
+        self.write_pos += chunk_len
+    
+    def consume(self, n):
+        """Veriyi silmek yerine sadece pointer ilerlet"""
+        self.read_pos += n
+        if self.read_pos > 512*1024:
+            self.compact()
+            
+    def compact(self):
+        remaining = self.write_pos - self.read_pos
+        if remaining > 0 and self.read_pos > 0:
+            self.data[:remaining] = self.data[self.read_pos:self.write_pos]
+        self.read_pos = 0
+        self.write_pos = remaining
+    
+    def view(self, n):
+        """Kopyalamadan memoryview döndür"""
+        return memoryview(self.data)[self.read_pos:self.read_pos + n]
+    
+    def __len__(self):
+        return self.write_pos - self.read_pos
+
 def trace_reader_proc(trace_file, q_out):
     """Sürekli /proc/svm_trace okuyan ve paketleyen Producer süreci."""
     try:
@@ -176,7 +216,7 @@ def trace_reader_proc(trace_file, q_out):
             flags = fcntl.fcntl(fd, fcntl.F_GETFL)
             fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
             
-            buf = bytearray()
+            cbuf = CircularBuffer()
             while True:
                 try:
                     # En fazla 64KB oku (performans için)
@@ -186,7 +226,7 @@ def trace_reader_proc(trace_file, q_out):
                         # 100ms bekle ve tekrar dene (belki yeni bir seans başlar)
                         time.sleep(0.1)
                         continue
-                    buf.extend(chunk)
+                    cbuf.append(chunk)
                 except BlockingIOError:
                     # Okunacak veri yok, CPU'yu yorma
                     time.sleep(0.01)
@@ -195,15 +235,18 @@ def trace_reader_proc(trace_file, q_out):
                     break
                 
                 # Tamponu erit
-                while len(buf) >= ENTRY_SIZE:
+                while len(cbuf) >= ENTRY_SIZE:
                     # 1. Header'ı kontrol et
-                    header_raw = buf[:ENTRY_SIZE]
+                    cur_view = cbuf.view(len(cbuf))
+                    header_raw = cur_view[:ENTRY_SIZE]
                     magic = struct.unpack("<Q", header_raw[:8])[0]
                     
                     if magic != MAGIC_EXPECTED:
                         # Senkronizasyon kaybı! Bir sonraki byte'a geç ve senkron ara.
-                        del buf[0]
-                        q_out.put(('DROP',))
+                        cbuf.consume(1)
+                        try:
+                            q_out.put_nowait(('DROP',))
+                        except Exception: pass
                         continue
                         
                     # 2. Header'ı tamamen aç (ENTRY_FMT: <QQIIQQQII32Q)
@@ -226,8 +269,10 @@ def trace_reader_proc(trace_file, q_out):
                         # Sanity: Sayfa verisi 4KB olmalı, ama esneklik için 16KB limit koyuyoruz.
                         if data_size > 16384:
                             # Tehlili paket veya senkron kaybı.
-                            del buf[0]
-                            q_out.put(('DROP',))
+                            cbuf.consume(1)
+                            try:
+                                q_out.put_nowait(('DROP',))
+                            except Exception: pass
                             continue
                             
                         total_expected = ENTRY_SIZE + data_size
@@ -235,7 +280,7 @@ def trace_reader_proc(trace_file, q_out):
                         # Bilinmeyen event type. Senkronu bozmamak için sadece header'ı atla.
                         total_expected = ENTRY_SIZE
 
-                    if len(buf) < total_expected:
+                    if len(cbuf) < total_expected:
                         # Payload henüz gelmemiş, döngüden çıkıp daha fazla veri bekle
                         break
                         
@@ -250,14 +295,18 @@ def trace_reader_proc(trace_file, q_out):
                                 branches.append((frm, to))
                         
                         # Resiliency: If no branches, send the RIP itself as a progress point
-                        q_out.put(('LBR', tsc, branches, rip))
+                        try:
+                            q_out.put_nowait(('LBR', tsc, branches, rip))
+                        except Exception: pass
                     
                     elif ev_type == 2: # DIRTY PAGE
-                        payload = bytes(buf[ENTRY_SIZE:total_expected])
-                        q_out.put(('MUT', tsc, cr3, rip, gpa, payload))
+                        payload = bytes(cur_view[ENTRY_SIZE:total_expected])
+                        try:
+                            q_out.put_nowait(('MUT', tsc, cr3, rip, gpa, payload))
+                        except Exception: pass
                     
                     # İşlenen veriyi tampondan sil
-                    del buf[:total_expected]
+                    cbuf.consume(total_expected)
     except KeyboardInterrupt:
         pass
     except Exception as e:

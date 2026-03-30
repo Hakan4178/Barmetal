@@ -18,8 +18,11 @@
 
 /* AMD NPF ExitCode and info1 flags */
 #define SVM_EXIT_NPF 0x400
-#define NPF_INFO1_WRITE (1ULL << 1)
 #define NPF_INFO1_PRESENT (1ULL << 0)
+#define NPF_INFO1_WRITE   (1ULL << 1)
+#define NPF_INFO1_USER    (1ULL << 2)
+#define NPF_INFO1_RSV     (1ULL << 3)
+#define NPF_INFO1_EXECUTE (1ULL << 4)  /* Phase 18: NX violation */
 
 /* AMD VMCB exception intercept: #DB = vector 1 */
 #define EXCEPT_DB_BIT (1U << 1)
@@ -37,6 +40,15 @@
  * never legitimate and indicates a confused or malicious guest.
  */
 #define NPT_PHYS_LIMIT (1ULL << 36) /* 64 GB */
+
+/*
+ * TSC Drift Guard: Maximum compensation per single #NPF exit.
+ * ~10ms at 3GHz = 30,000,000 cycles. If hypervisor somehow
+ * spends more than this in a single NPF (impossible normally),
+ * we cap to prevent Clock Drift panics from TCP timestamps,
+ * RTC desync, or Windows CLOCK_WATCHDOG_TIMEOUT.
+ */
+#define TSC_COMP_MAX_DELTA (30000000ULL)
 
 /* ═══════════════════════════════════════════════════════════════════════════
  *  TSC Jitter PRNG — Anti Timing Analysis
@@ -135,10 +147,36 @@ static void handle_msr(struct vmcb *vmcb, struct guest_regs *regs)
 	 */
 
 	if (is_write) {
+		u64 wval = (regs->rdx << 32) | (vmcb->save.rax & 0xFFFFFFFFULL);
+
+		switch (msr_num) {
 		/*
-		 * Silently ignore writes to intercepted MSRs.
-		 * Writing to TSC/LSTAR/STAR could break host state.
+		 * [PHASE 19] Thread Doğumu Tespiti (Pure VMI)
+		 * OS yeni thread için TLS alanı ayarlarken WRMSR FS/GS_BASE
+		 * yazar. Bu yazma işlemi #VMEXIT üretir ve burada yakalanır.
+		 * Yazma işlemini native olarak gerçekleştiriyoruz (TLS bozulmasın)
+		 * ancak olayı telemetry ring buffer'a logluyoruz.
+		 *
+		 * NOT: SWAPGS de MSR_GS_BASE üzerinden geçer, bu sayede
+		 * user→kernel geçişleri de otomatik olarak yakalanır.
 		 */
+		case 0xC0000100: /* MSR_FS_BASE */
+		case 0xC0000101: /* MSR_GS_BASE */
+		case 0xC0000102: /* MSR_KERNEL_GS_BASE */
+			pr_info_ratelimited("[PHASE19] Thread TLS write: MSR 0x%x = 0x%llx (PID context CR3=0x%llx)\n",
+					   msr_num, wval, vmcb->save.cr3);
+			/* Native execute: TLS/SWAPGS bozulmamalı */
+			wrmsrq(msr_num, wval);
+			break;
+
+		default:
+			/*
+			 * Silently ignore writes to other intercepted MSRs.
+			 * Writing to TSC/LSTAR/STAR could break host state.
+			 */
+			break;
+		}
+
 		vmcb->save.rip = vmcb->control.next_rip;
 		return;
 	}
@@ -434,14 +472,100 @@ int svm_run_guest(struct svm_context *ctx, struct guest_regs *regs)
 	case SVM_EXIT_NPF: {
 		u64 info1 = ctx->vmcb->control.exit_info_1;
 		u64 gpa = ctx->vmcb->control.exit_info_2;
+		u64 npf_entry_tsc = rdtsc(); /* TSC Compensation: Zamanlayıcıyı başlat */
+
+		/*
+		 * ═══════════════════════════════════════════════════════════════
+		 * Phase 18 [IF]: Surgical NX Execute-Fault Handler (Hardened)
+		 *
+		 * VMP decrypted bir sayfayı execute etmeye kalktığında
+		 * NPT'deki NX biti #NPF üretir. Sadece izlenen (watched)
+		 * sayfalar bu dallanmaya düşer.
+		 *
+		 * TSC COMPENSATION: Her #NPF'de hypervisor'da geçen süre
+		 * hesaplanır ve vmcb->control.tsc_offset'ten düşülür.
+		 * Guest RDTSC okuduğunda zamanın büküldüğünü göremez.
+		 *
+		 * INVLPGA: Full TLB flush yerine sadece hedef ASID+GPA
+		 * çifti invalidate edilir. O(1) maliyet.
+		 * ═══════════════════════════════════════════════════════════════
+		 */
+		if (info1 & NPF_INFO1_EXECUTE) {
+			u32 watch_flags = npt_hook_is_watched(gpa);
+
+			if (watch_flags & NPT_WATCH_NX) {
+				/* GPA güvenlik kontrolü */
+				if (gpa >= NPT_PHYS_LIMIT || !pfn_valid(gpa >> PAGE_SHIFT))
+					break;
+
+				/* Telemetry: Execute trap logla */
+				void *hva = phys_to_virt(gpa & PAGE_MASK);
+
+				svm_trace_emit_dirty(ctx->vmcb->save.cr3,
+						     ctx->vmcb->save.rip,
+						     gpa & PAGE_MASK, hva);
+
+				/* NPT'den geçici olarak NX'i kaldır (execute izni ver) */
+				{
+					u64 *pml4 = ctx->npt.pml4;
+					int pml4i = (gpa >> 39) & 0x1FF;
+					int pdpti = (gpa >> 30) & 0x1FF;
+					int pdi = (gpa >> 21) & 0x1FF;
+
+					u64 pdpt_phys = pml4[pml4i] & ~0xFFFULL;
+
+					if (!pdpt_phys || !pfn_valid(pdpt_phys >> PAGE_SHIFT))
+						goto skip_nx_rearm;
+					u64 *pdpt = phys_to_virt(pdpt_phys);
+
+					u64 pd_phys = pdpt[pdpti] & ~0xFFFULL;
+
+					if (!pd_phys || !pfn_valid(pd_phys >> PAGE_SHIFT))
+						goto skip_nx_rearm;
+					u64 *pd = phys_to_virt(pd_phys);
+
+					pd[pdi] &= ~NPT_NX; /* Geçici execute izni */
+				}
+
+				/*
+				 * INVLPGA: Sadece bu ASID+GPA için TLB entry'sini düşür.
+				 * Full flush (TLB_CTL=1) yapmak yerine cerrahi invalidation.
+				 *
+				 * NOT: INVLPGA sadece yerel çekirdeğin TLB'sini temizler.
+				 * Multi-core senaryoda stale TLB riski var. Ancak Matrix
+				 * süreci CPU 0'a pinli olduğu için (svm_chardev.c) bu
+				 * güvenli. Faz 19'da multi-core desteği gelirse INVLPGB
+				 * veya IPI-flush mekanizmasına geçilmeli.
+				 */
+				asm volatile("invlpga" :: "a"(gpa & PAGE_MASK),
+					     "c"((u32)ctx->vmcb->control.asid));
+
+skip_nx_rearm:
+				ctx->pending_rearm_gpa = gpa & PAGE_MASK;
+				ctx->vmcb->save.rflags |= RFLAGS_TF;
+				ctx->vmcb->control.intercepts[INTERCEPT_EXCEPTION_OFFSET >> 5] |=
+				    EXCEPT_DB_BIT;
+				ctx->vmcb->control.clean &= ~(VMCB_CLEAN_NP | VMCB_CLEAN_INTERCEPTS);
+			}
+
+			/* TSC Compensation: Hypervisor'da geçen süreyi Guest TSC'den sil */
+			{
+				u64 npf_exit_tsc = rdtsc();
+				u64 hv_delta = npf_exit_tsc - npf_entry_tsc;
+
+				/* Drift Guard: Üst sınır aşılırsa cap uygula */
+				if (hv_delta > TSC_COMP_MAX_DELTA)
+					hv_delta = TSC_COMP_MAX_DELTA;
+
+				ctx->vmcb->control.tsc_offset -= hv_delta;
+				ctx->vmcb->control.clean &= ~VMCB_CLEAN_TSC;
+			}
+			break;
+		}
 
 		if (info1 & NPF_INFO1_WRITE) {
 			/*
 			 * SECURITY: Validate GPA is within our identity map.
-			 * A confused/malicious guest could craft a GPA targeting
-			 * BIOS/ACPI/firmware regions. pfn_valid() alone is not
-			 * sufficient — it passes for any RAM-backed PFN including
-			 * reserved regions. Bound-check against NPT_PHYS_LIMIT.
 			 */
 			if (gpa >= NPT_PHYS_LIMIT)
 				break;
@@ -475,13 +599,31 @@ int svm_run_guest(struct svm_context *ctx, struct guest_regs *regs)
 				pd[pdi] |= NPT_WRITE;
 			}
 
+			/*
+			 * INVLPGA: Cerrahi TLB invalidation (Write-fault path)
+			 */
+			asm volatile("invlpga" :: "a"(gpa & PAGE_MASK),
+				     "c"((u32)ctx->vmcb->control.asid));
+
 skip_rearm:
 			ctx->pending_rearm_gpa = gpa & PAGE_MASK;
 			ctx->vmcb->save.rflags |= RFLAGS_TF;
 			ctx->vmcb->control.intercepts[INTERCEPT_EXCEPTION_OFFSET >> 5] |=
 			    EXCEPT_DB_BIT;
-			ctx->pending_rearm_gpa = gpa & PAGE_MASK;
 			ctx->vmcb->control.clean &= ~(VMCB_CLEAN_NP | VMCB_CLEAN_INTERCEPTS);
+
+			/* TSC Compensation: Write-fault path */
+			{
+				u64 npf_exit_tsc = rdtsc();
+				u64 hv_delta = npf_exit_tsc - npf_entry_tsc;
+
+				/* Drift Guard: Üst sınır aşılırsa cap uygula */
+				if (hv_delta > TSC_COMP_MAX_DELTA)
+					hv_delta = TSC_COMP_MAX_DELTA;
+
+				ctx->vmcb->control.tsc_offset -= hv_delta;
+				ctx->vmcb->control.clean &= ~VMCB_CLEAN_TSC;
+			}
 		}
 		break;
 	}

@@ -22,7 +22,7 @@ extern wait_queue_head_t svm_trace_wq;
 
 /* Global lock to prevent multi-thread DoS and VMCB corruption */
 atomic_t matrix_active = ATOMIC_INIT(0);
-static pid_t matrix_owner_pid;
+pid_t matrix_owner_pid;
 
 static long svm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {

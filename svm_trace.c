@@ -371,6 +371,9 @@ static const struct proc_ops pops_trace = {
 
 int svm_trace_init(void)
 {
+	/* Enforce strict ABI size matching the Python script (312 bytes) */
+	BUILD_BUG_ON(sizeof(struct svm_trace_entry) != 312);
+
 	svm_tring.size = SVM_TRACE_BUF_SIZE;
 	svm_tring.buffer = vzalloc(svm_tring.size);
 	if (!svm_tring.buffer) {
