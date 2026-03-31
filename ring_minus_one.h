@@ -169,6 +169,8 @@ struct svm_context {
 
   u64 pending_rearm_gpa;
   u32 kernel_pf_count;  /* Ping-Pong Guard: ardışık kernel #PF sayacı */
+  u64 last_npf_gpa;     /* NPF Loop Kill Switch: fault GPA */
+  u32 npf_loop_count;   /* NPF Loop Kill Switch: fault count */
 
   /* [PHASE 19 V2] Multi-core migration session state */
   u64 session_rip;

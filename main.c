@@ -276,9 +276,10 @@ int vmcb_prepare_npt(struct svm_context *ctx, u64 g_rip, u64 g_rsp, u64 g_cr3)
 	vmcb->save.fs.base = msr_val;
 
 	/* EFER Register - SVME Enable and Disable SCE (SYSCALL) to catch transitions
+	 * by forcing an Invalid Opcode (#UD) exception in the guest.
 	 */
 	rdmsrl(MSR_EFER, msr_val);
-	vmcb->save.efer = (msr_val | EFER_SVME);
+	vmcb->save.efer = (msr_val | EFER_SVME) & ~EFER_SCE;
 
 	/* TR (Task Register) - Triple Fault Fix (Security Fix #3)
 	 * 64-bit TSS descriptor = 16 byte (desc[0..3]), Intel/AMD SDM Vol.3 §7.2.3

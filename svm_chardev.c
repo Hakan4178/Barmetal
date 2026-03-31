@@ -132,9 +132,21 @@ static long svm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		}
 
 		/* ─── VMRUN HYPERVISOR LOOP (Migration-Aware) ─── */
+		u64 iter_count = 0;
 		while (1) {
 			int cpu;
 			struct percpu_vmcb *pv;
+
+			/*
+			 * Kill Switch 3: Global Execution Timeout (Soft-Lockguard Guard)
+			 * Guest 50 milyon denemede halen userspace'e uyanamadıysa
+			 * makineyi dondurmamak için zorla çıkart.
+			 */
+			if (++iter_count > 50000000ULL) {
+				pr_emerg("[MATRIX] *** KILL SWITCH: GLOBAL LOOP TIMEOUT EXCEEDED! Ejecting. ***\n");
+				ret_loop = -ETIME;
+				break;
+			}
 
 			if (signal_pending(current)) {
 				pr_info("[NTP_SYNC] Thread caught signal, exiting Matrix.\n");

@@ -483,9 +483,28 @@ int svm_run_guest(struct svm_context *ctx, struct guest_regs *regs)
 #endif
 
 	case SVM_EXIT_NPF: {
-		u64 info1 = ctx->vmcb->control.exit_info_1;
 		u64 gpa = ctx->vmcb->control.exit_info_2;
+		u64 error_code = ctx->vmcb->control.exit_info_1;
+
 		u64 npf_entry_tsc = rdtsc(); /* TSC Compensation: Zamanlayıcıyı başlat */
+
+		/*
+		 * Kill Switch 2: NPF Infinite Loop Guard
+		 * Eğer aynı GPA üzerinde sürekli NPF hatası alıyorsak (decoder bypass
+		 * veya forward progress yoksa), sistemi kilitlenmekten (hard-lock) kurtar.
+		 */
+		if (gpa == ctx->last_npf_gpa) {
+			ctx->npf_loop_count++;
+			if (ctx->npf_loop_count > 10000) {
+				pr_emerg("[MATRIX] *** KILL SWITCH: NPF INFINITE LOOP at GPA 0x%llx! Ejecting. ***\n", gpa);
+				ctx->npf_loop_count = 0;
+				ret = 1;
+				break;
+			}
+		} else {
+			ctx->last_npf_gpa = gpa;
+			ctx->npf_loop_count = 0;
+		}
 
 		/*
 		 * ═══════════════════════════════════════════════════════════════
