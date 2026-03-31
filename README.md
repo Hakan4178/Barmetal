@@ -6,18 +6,15 @@ Kapatılan açık sayısı:134
 
 Barmetal is a Ring-1 (Hypervisor) level Virtual Machine Introspection (VMI) research engine designed for AMD processors. It operates below the standard operating system layer by utilizing AMD SVM (Secure Virtual Machine) hardware extensions.
 
-## Current Architecture and Phases
+## Current Architecture (V2.0 — Hardened)
 
-This project spans several developmental phases to mature the VMI implementations:
-- **Phase 0-2 (Legacy):** Memory snapshotting, basic LBR tracing, and NPF trap handling via global kthreads.
-- **Phase 3.3 - Matrix Portal (Current):** A stealthy, `ioctl()`-driven process-level virtualization engine. The target process is injected via Ghost shellcode (`/proc/ntpd_policy`) and safely encapsulated into an isolated VMCB sandbox completely transparent to the host OS.
-- **Phase 3.4 (WIP):** Advanced device hiding to mask the `/dev/ntp_sync` portal and other hypervisor artifacts from Userland tools.
+This project has evolved into a "Silicon Watchtower" class bare-metal hypervisor, defeating advanced Anti-Cheat timing attacks and escaping OS-level hooks.
 
-## Technical Details (Phase 3.3)
-- **CPU MSR Fragmentation Fix:** Strict module initialization pinning to Core 0 to prevent `#UD` Invalid Opcode crashes during CPL transitions.
-- **Triple Fault Armor:** Full 64-bit TR base GDT parsing and strict bounds checking.
-- **Matrix Escape Hatch:** EFER.SCE masking ensures that any guest `SYSCALL` securely traps to the hypervisor (#UD handler), preventing SMEP/SMAP host panics.
-- **Zero-Day Patches:** Precise instruction length bypass validations (`next_rip`), per-process rearm state synchronization, and Ghost DoS starvation lock prevention.
+- **Phase 15 (Clean State):** `LD_PRELOAD` stealth ghosting. No `ptrace` anomalies.
+- **Phase 16 (Timing Armor):** Pure native execution via `EFER.SCE=1` passthrough, with zero `#VMEXIT` overhead.
+- **Phase 17 (LBR Illusion):** LBR Virtualization enabled; Branch tracing isolated per-ASID.
+- **Phase 18 (Surgical NPT):** Precision TLB manipulation via `INVLPGA`. Includes **Per-NPF TSC Compensation** and Drift Guards to flawlessly hide hypervisor presence and neutralize timing attacks.
+- **Phase 19 (Pure VMI):** Sandbox escape prevention moved from generic kernel Kprobes to direct silicon interception (`MSR_FS_BASE` / `MSR_GS_BASE` write trapping for thread birth and SWAPGS).
 
 ## Installation
 
@@ -42,12 +39,12 @@ Check kernel logs (`dmesg | tail`) to verify successful engine deployment and ze
 
 ## Usage
 
-Interaction is handled via the stealth Ghost Injection workflow and the Python daemon:
+Interaction is handled via the stealth `svm_run` launcher and the Python daemon:
 
-1. **Target Selection:**
-Arm the Ghost injection engine by specifying the target process name via the unified policy port.
+1. **Build Tools:**
+Make sure you compile the Userland Loader.
 ```bash
-echo "sleep" | sudo tee /proc/ntpd_policy
+cd tools && make && cd ..
 ```
 
 2. **Start Monitoring Daemon:**
@@ -57,9 +54,9 @@ sudo python3 tools/svm_cli.py live --out-dir ./mutations --log live_trace_report
 ```
 
 3. **Execute Target:**
-Run the target application. It will be seamlessly trapped into the Matrix sandbox without any userland footprint (No `ptrace`).
+Run the target application through the Stealth Launcher. It uses `LD_PRELOAD` to silently bootstrap the Matrix environment right before `main()` executes.
 ```bash
-sleep 1000
+./tools/svm_run /usr/bin/sleep 1000
 ```
 
 ## Unloading
