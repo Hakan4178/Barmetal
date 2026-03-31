@@ -484,7 +484,7 @@ int svm_run_guest(struct svm_context *ctx, struct guest_regs *regs)
 
 	case SVM_EXIT_NPF: {
 		u64 gpa = ctx->vmcb->control.exit_info_2;
-		u64 error_code = ctx->vmcb->control.exit_info_1;
+		u64 info1 = ctx->vmcb->control.exit_info_1;
 
 		u64 npf_entry_tsc = rdtsc(); /* TSC Compensation: Zamanlayıcıyı başlat */
 
