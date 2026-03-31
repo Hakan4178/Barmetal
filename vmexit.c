@@ -34,6 +34,19 @@
 
 #define VMEXIT_MAX_ITERATIONS 100000
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ *  Kill Switch — Matrix'in "Altın Çıkışı"
+ *
+ *  Guest RAX + RBX magic pattern ile hypervisor'dan acil çıkış.
+ *  Geliştirici güvenlik ağı: sonsuz döngü veya #PF ping-pong'da
+ *  makineyi resetlemek yerine temiz çıkış sağlar.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+#define KILL_SWITCH_RAX  0xDEADBEEFDEADBEEFULL
+#define KILL_SWITCH_RBX  0x1337133713371337ULL
+
+/* Ping-Pong Guard: ardışık kernel #PF re-injection limiti */
+#define KERNEL_PF_REINJECT_MAX 256
+
 /*
  * NPT identity map physical limit. Must match the value passed to
  * npt_build_identity_map() in main.c. GPA outside this range is
@@ -681,15 +694,46 @@ skip_rearm:
 		u8 dummy;
 
 		/*
-		 * SECURITY: Reject kernel-space fault addresses.
-		 * copy_from_user has access_ok() but this is defense-in-depth.
+		 * Kill Switch: Guest magic register pattern ile acil çıkış.
+		 * RAX=0xDEADBEEF... + RBX=0x1337... → temiz Matrix eject.
 		 */
-		if (fault_va >= TASK_SIZE_MAX) {
-			pr_err("[MATRIX_ESCAPE] #PF with kernel VA 0x%llx. Ejecting.\n",
-			       fault_va);
+		if (ctx->vmcb->save.rax == KILL_SWITCH_RAX &&
+		    regs->rbx == KILL_SWITCH_RBX) {
+			pr_emerg("[MATRIX] *** KILL SWITCH TRIGGERED *** Ejecting PID %d\n",
+				 current->pid);
+			ctx->kernel_pf_count = 0;
 			ret = 1;
 			break;
 		}
+
+		/*
+		 * Kernel-space #PF: Guest kernel'in kendi #PF handler'ına
+		 * geri enjekte et. SYSCALL path'inde demand paging, per-CPU
+		 * erişimi vb. meşru sayfa hatalarıdır.
+		 * AMD APM Vol.2 §15.20: Event Injection
+		 */
+		if (fault_va >= TASK_SIZE_MAX) {
+			/* Ping-Pong Guard: ardışık re-injection sayacı */
+			ctx->kernel_pf_count++;
+			if (ctx->kernel_pf_count > KERNEL_PF_REINJECT_MAX) {
+				pr_err("[MATRIX] PING-PONG GUARD: %u consecutive kernel #PFs! Ejecting.\n",
+				       ctx->kernel_pf_count);
+				ctx->kernel_pf_count = 0;
+				ret = 1;
+				break;
+			}
+
+			ctx->vmcb->control.event_inj =
+			    SVM_EVTINJ_VALID | SVM_EVTINJ_TYPE_EXEPT |
+			    SVM_EVTINJ_VALID_ERR | 14;
+			ctx->vmcb->control.event_inj_err = error_code;
+			ctx->vmcb->save.cr2 = fault_va;
+			ret = 0;
+			break;
+		}
+
+		/* User-space #PF — sayacı sıfırla */
+		ctx->kernel_pf_count = 0;
 
 		/*
 		 * Ghost Target Demand Paging / CoW Proxy

@@ -33,6 +33,10 @@ static struct snap_context snap_ctx = {0};
 struct svm_context *g_svm = &svm_ctx;
 struct snap_context *g_snap = &snap_ctx;
 
+/* [PHASE 19 V2] Per-CPU VMCB storage and multi-core globals */
+DEFINE_PER_CPU(struct percpu_vmcb, cpu_vmcbs);
+u64 g_target_cr3;
+
 /* ═══════════════════════════════════════════════════════════════════════════
  *  MSRPM Adres Makroları (AMD APM Vol.2 §15.11)
  *
@@ -246,12 +250,30 @@ int vmcb_prepare_npt(struct svm_context *ctx, u64 g_rip, u64 g_rsp, u64 g_cr3)
 	vmcb->save.cstar = msr_val;
 	rdmsrl(MSR_SYSCALL_MASK, msr_val);
 	vmcb->save.sfmask = msr_val;
-	rdmsrl(MSR_KERNEL_GS_BASE, msr_val);
-	vmcb->save.kernel_gs_base = msr_val;
+	
+	/* 
+	 * CRITICAL FIX: GS Base Swap Issue
+	 * We are currently in ioctl (kernel space), so:
+	 *   MSR_GS_BASE = Kernel Per-CPU pointer
+	 *   MSR_KERNEL_GS_BASE = Userspace TLS pointer
+	 *
+	 * But we are dropping the guest directly into CPL=3. In CPL=3, GS_BASE 
+	 * must hold the userspace TLS. When the guest later executes SYSCALL, 
+	 * 'swapgs' will swap GS_BASE and KERNEL_GS_BASE, putting the Per-CPU 
+	 * pointer (which it needs) into GS_BASE.
+	 *
+	 * Thus, we MUST swap them here while saving into the VMCB.
+	 */
+	{
+		u64 host_gs, host_kgs;
+		rdmsrl(MSR_GS_BASE, host_gs);
+		rdmsrl(MSR_KERNEL_GS_BASE, host_kgs);
+		vmcb->save.gs.base = host_kgs;        /* Userspace TLS for CPL=3 */
+		vmcb->save.kernel_gs_base = host_gs;  /* Kernel Per-CPU for swapgs */
+	}
+
 	rdmsrl(MSR_FS_BASE, msr_val);
 	vmcb->save.fs.base = msr_val;
-	rdmsrl(MSR_GS_BASE, msr_val);
-	vmcb->save.gs.base = msr_val;
 
 	/* EFER Register - SVME Enable and Disable SCE (SYSCALL) to catch transitions
 	 */
@@ -369,9 +391,50 @@ int vmcb_prepare_npt(struct svm_context *ctx, u64 g_rip, u64 g_rsp, u64 g_cr3)
  * ═══════════════════════════════════════════════════════════════════════════
  */
 
+/* [PHASE 19 V2] IPI Callbacks — All-core SVME management */
+static void enable_svme_on_cpu(void *info)
+{
+	u64 efer;
+	struct percpu_vmcb *pv = this_cpu_ptr(&cpu_vmcbs);
+
+	rdmsrl(MSR_EFER, efer);
+	if (!(efer & EFER_SVME)) {
+		efer |= EFER_SVME;
+		wrmsrl(MSR_EFER, efer);
+	}
+	wrmsrl(MSR_VM_HSAVE_PA, pv->hsave_pa);
+}
+
+static void disable_svme_on_cpu(void *info)
+{
+	u64 efer;
+
+	wrmsrl(MSR_VM_HSAVE_PA, 0);
+	rdmsrl(MSR_EFER, efer);
+	efer &= ~EFER_SVME;
+	wrmsrl(MSR_EFER, efer);
+}
+
+static void free_percpu_vmcbs(void)
+{
+	int cpu;
+
+	for_each_online_cpu(cpu) {
+		struct percpu_vmcb *pv = per_cpu_ptr(&cpu_vmcbs, cpu);
+
+		if (pv->vmcb) {
+			free_page((unsigned long)pv->vmcb);
+			pv->vmcb = NULL;
+		}
+		if (pv->hsave_va) {
+			free_page((unsigned long)pv->hsave_va);
+			pv->hsave_va = NULL;
+		}
+	}
+}
+
 static int __init svm_module_init(void)
 {
-	u64 efer_val;
 	int ret;
 	u32 eax, ebx, ecx, edx;
 
@@ -413,37 +476,47 @@ static int __init svm_module_init(void)
 	if (ret < 0)
 		goto err_npt;
 
-	/* 3) EFER.SVME etkinleştir */
-	rdmsrl(MSR_EFER, efer_val);
-	if (!(efer_val & EFER_SVME)) {
-		efer_val |= EFER_SVME;
-		wrmsrl(MSR_EFER, efer_val);
-		pr_info("SVME biti etkinleştirildi.\n");
+	/* 3+4) Per-CPU VMCB + HSAVE tahsisi ve SVME etkinleştirme */
+	{
+		int cpu;
+
+		for_each_online_cpu(cpu) {
+			struct percpu_vmcb *pv = per_cpu_ptr(&cpu_vmcbs, cpu);
+
+			pv->vmcb = (struct vmcb *)__get_free_page(GFP_KERNEL | __GFP_ZERO);
+			if (!pv->vmcb) {
+				pr_err("[INIT] VMCB alloc failed for CPU %d\n", cpu);
+				ret = -ENOMEM;
+				goto err_percpu;
+			}
+			pv->vmcb_pa = virt_to_phys(pv->vmcb);
+
+			pv->hsave_va = (void *)__get_free_page(GFP_KERNEL | __GFP_ZERO);
+			if (!pv->hsave_va) {
+				pr_err("[INIT] HSAVE alloc failed for CPU %d\n", cpu);
+				free_page((unsigned long)pv->vmcb);
+				pv->vmcb = NULL;
+				ret = -ENOMEM;
+				goto err_percpu;
+			}
+			pv->hsave_pa = virt_to_phys(pv->hsave_va);
+		}
+
+		/* SVME + HSAVE MSR'larini tum core'larda etkinlestir */
+		on_each_cpu(enable_svme_on_cpu, NULL, 1);
+		pr_info("[INIT] SVME + HSAVE aktif: %d core\n", num_online_cpus());
 	}
 
-	/* 4) HSAVE alanı */
-	svm_ctx.hsave_va = (void *)__get_free_page(GFP_KERNEL | __GFP_ZERO);
-	if (!svm_ctx.hsave_va) {
-		pr_err("HSAVE tahsis hatası.\n");
-		ret = -ENOMEM;
-		goto err_npt;
-	}
-	svm_ctx.hsave_pa = virt_to_phys(svm_ctx.hsave_va);
-	wrmsrl(MSR_VM_HSAVE_PA, svm_ctx.hsave_pa);
-
-	/* 5) VMCB */
-	svm_ctx.vmcb = (struct vmcb *)__get_free_page(GFP_KERNEL | __GFP_ZERO);
-	if (!svm_ctx.vmcb) {
-		ret = -ENOMEM;
-		goto err_hsave;
-	}
-	svm_ctx.vmcb_pa = virt_to_phys(svm_ctx.vmcb);
+	/* Varsayilan VMCB isaretcisi CPU 0'a isaret eder */
+	svm_ctx.vmcb = per_cpu_ptr(&cpu_vmcbs, 0)->vmcb;
+	svm_ctx.vmcb_pa = per_cpu_ptr(&cpu_vmcbs, 0)->vmcb_pa;
+	svm_ctx.last_cpu = -1;
 
 	/* 6) MSRPM - 64KB (Zen 4 requires 40KB) */
 	svm_ctx.msrpm_va = (void *)__get_free_pages(GFP_KERNEL | __GFP_ZERO, 4);
 	if (!svm_ctx.msrpm_va) {
 		ret = -ENOMEM;
-		goto err_vmcb;
+		goto err_msrpm;
 	}
 	svm_ctx.msrpm_pa = virt_to_phys(svm_ctx.msrpm_va);
 
@@ -508,16 +581,10 @@ err_msrpm:
 		free_pages((unsigned long)svm_ctx.msrpm_va, 4);
 		svm_ctx.msrpm_va = NULL;
 	}
-err_vmcb:
-	if (svm_ctx.vmcb) {
-		free_page((unsigned long)svm_ctx.vmcb);
-		svm_ctx.vmcb = NULL;
-	}
-err_hsave:
-	if (svm_ctx.hsave_va) {
-		free_page((unsigned long)svm_ctx.hsave_va);
-		svm_ctx.hsave_va = NULL;
-	}
+err_percpu:
+	on_each_cpu(disable_svme_on_cpu, NULL, 1);
+	free_percpu_vmcbs();
+	svm_ctx.vmcb = NULL;
 err_npt:
 	npt_destroy(&svm_ctx.npt);
 	return ret;
@@ -530,24 +597,13 @@ err_npt:
 
 static void __exit svm_module_exit(void)
 {
-	u64 efer_val;
-
-	/*
-	 * Clean-up MUST run on CPU 0 to wipe the correct MSR_VM_HSAVE_PA.
-	 * If rmmod runs on CPU 2, CPU 0's MSR is left permanently poisoned.
-	 */
-	set_cpus_allowed_ptr(current, cpumask_of(0));
-
 	/*
 	 * Paranoid: refuse to disable SVM if a guest is still running.
-	 * Module refcount should prevent this, but defense-in-depth.
 	 */
 	if (atomic_read(&matrix_active) != 0) {
 		pr_crit("[EXIT] WARNING: matrix_active != 0 during module unload!\n");
 		atomic_set(&matrix_active, 0);
 	}
-
-	/* Phase 3.1: No kthread cleanup anymore */
 
 	npt_hook_exit();
 	cleanup_syscall_spoofing();
@@ -559,12 +615,9 @@ static void __exit svm_module_exit(void)
 	procfs_exit(&snap_ctx);
 	npt_destroy(&svm_ctx.npt);
 
-	/* SVM cleanup */
-	rdmsrl(MSR_EFER, efer_val);
-	efer_val &= ~EFER_SVME;
-	wrmsrl(MSR_EFER, efer_val);
+	/* [PHASE 19 V2] All-core SVM cleanup */
+	on_each_cpu(disable_svme_on_cpu, NULL, 1);
 
-	/* Phase 3.1: No dummy code payload cleanup anymore */
 	if (svm_ctx.iopm_va) {
 		free_pages((unsigned long)svm_ctx.iopm_va, 2);
 		svm_ctx.iopm_va = NULL;
@@ -573,16 +626,11 @@ static void __exit svm_module_exit(void)
 		free_pages((unsigned long)svm_ctx.msrpm_va, 4);
 		svm_ctx.msrpm_va = NULL;
 	}
-	if (svm_ctx.vmcb) {
-		free_page((unsigned long)svm_ctx.vmcb);
-		svm_ctx.vmcb = NULL;
-	}
-	if (svm_ctx.hsave_va) {
-		free_page((unsigned long)svm_ctx.hsave_va);
-		svm_ctx.hsave_va = NULL;
-	}
 
-	pr_info("SVM modülü temizlendi.\n");
+	free_percpu_vmcbs();
+	svm_ctx.vmcb = NULL;
+
+	pr_info("SVM modülü temizlendi. (%d core SVME kapatildi)\n", num_online_cpus());
 }
 
 module_init(svm_module_init);

@@ -75,6 +75,16 @@
 
 /* ── Moved to npt_walk.h ── */
 
+/* [PHASE 19 V2] Per-CPU VMCB + HSAVE for multi-core tracking */
+struct percpu_vmcb {
+  struct vmcb *vmcb;
+  phys_addr_t vmcb_pa;
+  void *hsave_va;
+  phys_addr_t hsave_pa;
+};
+
+DECLARE_PER_CPU(struct percpu_vmcb, cpu_vmcbs);
+
 /* ═══════════════════════════════════════════════════════════════════════════
  *  Snapshot Sabitleri
  * ═══════════════════════════════════════════════════════════════════════════
@@ -158,6 +168,15 @@ struct svm_context {
   struct npt_context npt;
 
   u64 pending_rearm_gpa;
+  u32 kernel_pf_count;  /* Ping-Pong Guard: ardışık kernel #PF sayacı */
+
+  /* [PHASE 19 V2] Multi-core migration session state */
+  u64 session_rip;
+  u64 session_rsp;
+  u64 session_rax;
+  u64 session_rflags;
+  u64 session_cr3;
+  int last_cpu;
 
   /* Gerekli: Kapsamdan Cikinca Yok Olmamasi İcin Guest GPR'ler */
   struct guest_regs gregs;
@@ -256,6 +275,9 @@ static inline bool svm_rate_limit_check(struct snap_context *snap) {
 
 /* ── Global Lock Registry ── */
 extern atomic_t matrix_active;
+
+/* [PHASE 19 V2] Multi-core tracking globals */
+extern u64 g_target_cr3;
 
 /* [PHASE 16 ELSE] Native Syscall Spoofing Fallback */
 int init_syscall_spoofing(void);

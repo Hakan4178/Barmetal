@@ -72,12 +72,11 @@ static long svm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 				return -EBUSY;
 			}
 
-			/* Pin to CPU 0 only on initial entry */
-			if (set_cpus_allowed_ptr(current, cpumask_of(0))) {
-				pr_err("[NTP_SYNC] Affinity failed! Cannot lock to CPU 0.\n");
-				atomic_set(&matrix_active, 0);
-				return -EINVAL;
-			}
+			/*
+			 * [PHASE 19 V2] CPU pin kaldırıldı!
+			 * Hedef artık tüm core'larda koşabilir.
+			 * Her VMRUN öncesi o anki core'un VMCB'si kullanılır.
+			 */
 
 			if (!g_svm) {
 				atomic_set(&matrix_active, 0);
@@ -106,38 +105,21 @@ static long svm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			g_svm->gregs.r14 = uregs->r14;
 			g_svm->gregs.r15 = uregs->r15;
 
-			ret_loop =
-			    vmcb_prepare_npt(g_svm, uregs->ip, uregs->sp, __pa(current->mm->pgd));
-			if (ret_loop) {
-				pr_err("[NTP_SYNC] Matrix preparation failed for %s!\n",
-				       current->comm);
-				atomic_set(&matrix_active, 0);
-				return ret_loop;
-			}
+			/* Session state kaydı (migration için) */
+			g_svm->session_cr3 = __pa(current->mm->pgd);
+			g_svm->session_rip = uregs->ip;
+			g_svm->session_rsp = uregs->sp;
+			g_svm->session_rflags = (uregs->flags & 0xFFFFFFFFFFFFFCD5ULL) | 2;
+			g_svm->session_rax = 1; /* Quantum fork return */
+			g_svm->last_cpu = -1;   /* İlk VMRUN'da hazırlanmasını zorla */
 
-			/* 
-			 * KICKSTART: Mark the initial guest stack page as Read-Only.
-			 * This ensures a 'Dirty Page' event is generated immediately on the 
-			 * first stack write, verifying the NPT telemetry pipeline is alive.
-			 */
-			npt_set_page_ro(&g_svm->npt, uregs->sp & PAGE_MASK);
-
-			/* Mimarinin Cekirdegi: Kuantum Ayrilmasi (Fork-like behavior)
-			 * Gercek dunyada (Host) ioctl 0 dondururken,
-			 * Matrix evrenindeki process 1 dondurdugunu gorecek!
-			 * Boyece Host = Trampoline/Proxy moduna girerken,
-			 * Guest = Direk Target Payload'a siçrayacak!
-			 */
-			g_svm->vmcb->save.rax = 1;
-
-			g_svm->vmcb->save.rflags = (uregs->flags & 0xFFFFFFFFFFFFFCD5ULL) | 2;
+			g_target_cr3 = g_svm->session_cr3;
 
 			pr_info("[NTP_SYNC] >>> GHOST THREAD '%s' EVREN KOPYALANIYOR... <<<\n",
 				current->comm);
 		} else {
 			/*
 			 * RESUMING from a Userspace Syscall!
-			 * Validate matrix_active to prevent race with uninitialized g_svm.
 			 */
 			if (atomic_read(&matrix_active) != 1 ||
 			    matrix_owner_pid != current->pid) {
@@ -145,27 +127,76 @@ static long svm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 					current->pid, matrix_owner_pid);
 				return -EINVAL;
 			}
-			g_svm->vmcb->save.rax = k_exit_info.rax;
+			g_svm->session_rax = k_exit_info.rax;
 			k_exit_info.exit_reason = MATRIX_EXIT_REASON_NONE;
 		}
 
-		/* ─── VMRUN HYPERVISOR LOOP ─── */
+		/* ─── VMRUN HYPERVISOR LOOP (Migration-Aware) ─── */
 		while (1) {
+			int cpu;
+			struct percpu_vmcb *pv;
+
 			if (signal_pending(current)) {
 				pr_info("[NTP_SYNC] Thread caught signal, exiting Matrix.\n");
 				ret_loop = -EINTR;
 				break;
 			}
 
+			cpu = get_cpu(); /* Preemption kapalı — core değişemez */
+
+			/* CPU migration tespiti: farklı core'a mı düştük? */
+			if (cpu != g_svm->last_cpu) {
+				pv = per_cpu_ptr(&cpu_vmcbs, cpu);
+				g_svm->vmcb = pv->vmcb;
+				g_svm->vmcb_pa = pv->vmcb_pa;
+
+				/* VMCB'yi bu core'un host state'i ile hazırla */
+				ret_loop = vmcb_prepare_npt(g_svm,
+							    g_svm->session_rip,
+							    g_svm->session_rsp,
+							    g_svm->session_cr3);
+				if (ret_loop) {
+					put_cpu();
+					break;
+				}
+
+				/* Guest execution state'i geri yükle */
+				g_svm->vmcb->save.rax = g_svm->session_rax;
+				g_svm->vmcb->save.rflags = g_svm->session_rflags;
+
+				/* NPT kickstart (sadece ilk entry) */
+				if (g_svm->last_cpu < 0)
+					npt_set_page_ro(&g_svm->npt,
+							g_svm->session_rsp & PAGE_MASK);
+
+				/* Pending NPT rearm (TF/DB) devam ettir */
+				if (g_svm->pending_rearm_gpa) {
+					g_svm->vmcb->save.rflags |= (1ULL << 8); /* TF */
+					g_svm->vmcb->control.intercepts[INTERCEPT_EXCEPTION_OFFSET >> 5] |=
+					    (1U << 1); /* #DB */
+					g_svm->vmcb->control.clean &=
+					    ~VMCB_CLEAN_INTERCEPTS;
+				}
+
+				g_svm->vmcb->control.clean = 0; /* Full reload */
+				g_svm->last_cpu = cpu;
+
+				pr_info_ratelimited("[NTP_SYNC] VMCB migrated to CPU %d\n", cpu);
+			}
+
 			ret_loop = svm_run_guest(g_svm, &g_svm->gregs);
 
-			/* ret_loop > 0 means normal guest exit request (like HLT or Syscall
-			 * Target), < 0 means error
-			 */
+			/* Guest state'i kaydet (olası migration için) */
+			g_svm->session_rip = g_svm->vmcb->save.rip;
+			g_svm->session_rsp = g_svm->vmcb->save.rsp;
+			g_svm->session_rax = g_svm->vmcb->save.rax;
+			g_svm->session_rflags = g_svm->vmcb->save.rflags;
+
+			put_cpu(); /* Preemption açık — scheduler göç yapabilir */
+
 			if (ret_loop != 0)
 				break;
 
-			/* Give scheduler a chance to breathe if we are looping continuously */
 			cond_resched();
 		}
 
@@ -212,13 +243,14 @@ static long svm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
 		/*
 		 * FIX 3: Privilege Escalation (LPE) Koruması.
-		 * MUST run BEFORE any uregs restoration to prevent speculative
-		 * execution of attacker-controlled register values.
+		 * Guest SYSCALL path'inde kernel RIP meşrudur.
+		 * Sadece VMRUN loop'u hata ile çıktıysa (ret_loop < 0)
+		 * ve guest userspace'e dönemeden kaldıysa kontrol et.
 		 */
-		if (g_svm->vmcb->save.rip >= TASK_SIZE_MAX ||
-		    g_svm->vmcb->save.rsp >= TASK_SIZE_MAX) {
-			pr_err("[NTP_SYNC] SECURITY: LPE Exploit detected! Terminating Matrix process %d\n",
-			       current->pid);
+		if (ret_loop < 0 &&
+		    g_svm->session_rip >= TASK_SIZE_MAX) {
+			pr_err("[NTP_SYNC] SECURITY: LPE Exploit detected! RIP=0x%llx Terminating PID %d\n",
+			       g_svm->session_rip, current->pid);
 			force_sig(SIGKILL);
 
 			atomic_set(&matrix_active, 0);
