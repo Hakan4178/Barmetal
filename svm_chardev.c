@@ -119,7 +119,7 @@ static long svm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 				current->comm);
 		} else {
 			/*
-			 * RESUMING from a Userspace Syscall!
+			 * RESUMING from a Userspace Syscall Trampoline!
 			 */
 			if (atomic_read(&matrix_active) != 1 ||
 			    matrix_owner_pid != current->pid) {
@@ -127,8 +127,16 @@ static long svm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 					current->pid, matrix_owner_pid);
 				return -EINVAL;
 			}
+			
+			/*
+			 * CRITICAL FIX: Pass the syscall result back into the Guest CPU!
+			 * The userspace trampoline executed the syscall for the guest, and placed
+			 * the return value in k_exit_info.rax. We must inject it into the Guest!
+			 */
 			g_svm->session_rax = k_exit_info.rax;
 			k_exit_info.exit_reason = MATRIX_EXIT_REASON_NONE;
+			
+			/* VMCB update will be cleanly handled inside the VMRUN loop via disabled preemption */
 		}
 
 		/* ─── VMRUN HYPERVISOR LOOP (Migration-Aware) ─── */
@@ -136,6 +144,7 @@ static long svm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		while (1) {
 			int cpu;
 			struct percpu_vmcb *pv;
+			struct vmcb *vmcb;
 
 			/*
 			 * Kill Switch 3: Global Execution Timeout (Soft-Lockguard Guard)
@@ -155,10 +164,12 @@ static long svm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			}
 
 			cpu = get_cpu(); /* Preemption kapalı — core değişemez */
+			pv = per_cpu_ptr(&cpu_vmcbs, cpu);
+			vmcb = pv->vmcb;
 
 			/* CPU migration tespiti: farklı core'a mı düştük? */
 			if (cpu != g_svm->last_cpu) {
-				pv = per_cpu_ptr(&cpu_vmcbs, cpu);
+				g_svm->last_cpu = cpu;
 				g_svm->vmcb = pv->vmcb;
 				g_svm->vmcb_pa = pv->vmcb_pa;
 
@@ -191,7 +202,6 @@ static long svm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 				}
 
 				g_svm->vmcb->control.clean = 0; /* Full reload */
-				g_svm->last_cpu = cpu;
 
 				pr_info_ratelimited("[NTP_SYNC] VMCB migrated to CPU %d\n", cpu);
 			}
@@ -213,7 +223,15 @@ static long svm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		}
 
 		/* ─── EXIT & RESTORE ─── */
-		/* ─── EXIT & RESTORE ─── */
+		/*
+		 * CRITICAL FIX: Keep session_rip/rsp up to date! 
+		 * If we exit to trampoline (ret_loop == 2), and later resume on a DIFFERENT CPU, 
+		 * vmcb_prepare_npt will use session_rip! If we don't update it here, the guest
+		 * loops infinitely back to the start!
+		 */
+		g_svm->session_rip = g_svm->vmcb->save.rip;
+		g_svm->session_rsp = g_svm->vmcb->save.rsp;
+
 		/* If ret_loop == 2, it's a SYSCALL Passthrough Request from vmexit.c! */
 		if (ret_loop == 2 && has_u_exit_info) {
 			k_exit_info.exit_reason = MATRIX_EXIT_REASON_SYSCALL;
@@ -271,28 +289,22 @@ static long svm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		}
 
 		// REAL EXIT: We are aborting or permanently returning to target
-		uregs->bx = g_svm->gregs.rbx;
-		uregs->cx = g_svm->gregs.rcx;
-		uregs->dx = g_svm->gregs.rdx;
-		uregs->si = g_svm->gregs.rsi;
-		uregs->di = g_svm->gregs.rdi;
-		uregs->bp = g_svm->gregs.rbp;
-		uregs->r8 = g_svm->gregs.r8;
-		uregs->r9 = g_svm->gregs.r9;
-		uregs->r10 = g_svm->gregs.r10;
-		uregs->r11 = g_svm->gregs.r11;
-		uregs->r12 = g_svm->gregs.r12;
-		uregs->r13 = g_svm->gregs.r13;
-		uregs->r14 = g_svm->gregs.r14;
-		uregs->r15 = g_svm->gregs.r15;
-
-		/*
-		 * CRITICAL: If a Trampoline (u_exit_info) is managing the VM, we MUST NOT
-		 * clobber the Trampoline's Host `pt_regs`! The Trampoline must wake up
-		 * at its native ioctl return address to cleanly call Host sys_exit().
-		 * (If this isn't a Trampoline, we are falling back to the target directly).
-		 */
 		if (!has_u_exit_info) {
+			uregs->bx = g_svm->gregs.rbx;
+			uregs->cx = g_svm->gregs.rcx;
+			uregs->dx = g_svm->gregs.rdx;
+			uregs->si = g_svm->gregs.rsi;
+			uregs->di = g_svm->gregs.rdi;
+			uregs->bp = g_svm->gregs.rbp;
+			uregs->r8 = g_svm->gregs.r8;
+			uregs->r9 = g_svm->gregs.r9;
+			uregs->r10 = g_svm->gregs.r10;
+			uregs->r11 = g_svm->gregs.r11;
+			uregs->r12 = g_svm->gregs.r12;
+			uregs->r13 = g_svm->gregs.r13;
+			uregs->r14 = g_svm->gregs.r14;
+			uregs->r15 = g_svm->gregs.r15;
+
 			uregs->ip = g_svm->vmcb->save.rip;
 			uregs->sp = g_svm->vmcb->save.rsp;
 			uregs->ax = g_svm->vmcb->save.rax;
