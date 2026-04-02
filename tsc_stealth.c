@@ -51,3 +51,33 @@ u64 vmrun_tsc_compensated(struct svm_context *ctx) {
  * tsc_offset_reset - Bu CPU'nun TSC offset'ini sıfırla
  */
 void tsc_offset_reset(void) { this_cpu_write(pcpu_tsc_offset, 0); }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ *  TSC Jitter (PRNG tabanlı gürültü)
+ *
+ *  Without jitter: every CPUID takes exactly N cycles → detected as emulated.
+ *  With jitter: Gaussian-like noise makes timing look like real hardware
+ *  (cache miss, pipeline stall, branch misprediction variance).
+ *
+ *  Uses a fast 64-bit LCG (Linear Congruential Generator).
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
+
+static DEFINE_PER_CPU(u64, jitter_state);
+
+u64 tsc_jitter(u64 min, u64 max)
+{
+	u64 *state = this_cpu_ptr(&jitter_state);
+
+	if (!*state)
+		*state = 0x5DEECE66DULL ^ rdtsc();
+
+	/* LCG: state = state * 6364136223846793005 + 1442695040888963407 */
+	*state = *state * 6364136223846793005ULL + 1442695040888963407ULL;
+
+	/* Defensive: prevent UB if caller passes min > max */
+	if (unlikely(min >= max))
+		return min;
+
+	return min + ((*state >> 33) % (max - min + 1));
+}

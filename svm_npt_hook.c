@@ -61,6 +61,54 @@ static struct proc_dir_entry *hook_proc_entry;
  */
 
 /*
+ * Securely translate a Guest Physical Address (GPA) to a Host Physical 
+ * Address (HPA) by walking the NPT map.
+ */
+u64 npt_get_hpa(struct npt_context *ctx, u64 gpa)
+{
+	u64 *pml4 = ctx->pml4;
+	int pml4i = (gpa >> 39) & 0x1FF;
+	int pdpti = (gpa >> 30) & 0x1FF;
+	int pdi   = (gpa >> 21) & 0x1FF;
+	u64 pdpt_phys, *pdpt, pd_phys, *pd, pde, hpa_base;
+
+	if (!pml4) return 0;
+	
+	/* 1. PML4 -> PDPT */
+	if (!(pml4[pml4i] & 1)) return 0; /* Present bit check */
+	pdpt_phys = pml4[pml4i] & 0x000FFFFFFFFFF000ULL; /* NX (bit 63) ve reserved bit mask */
+	if (!pdpt_phys || !pfn_valid(pdpt_phys >> PAGE_SHIFT)) return 0;
+	pdpt = (u64 *)phys_to_virt(pdpt_phys); /* Pointer cast aritmetiği koruması */
+
+	/* 2. PDPT -> PD */
+	if (!(pdpt[pdpti] & 1)) return 0;
+	pd_phys = pdpt[pdpti] & 0x000FFFFFFFFFF000ULL;
+	if (!pd_phys || !pfn_valid(pd_phys >> PAGE_SHIFT)) return 0;
+	pd = (u64 *)phys_to_virt(pd_phys);
+
+	/* 3. PD -> PTE veya 2MB Page */
+	pde = pd[pdi];
+	if (!(pde & 1)) return 0; /* Present bit = 0 (sayfa NPT'de yok) */
+
+	/* Active SVM Identity Map currently uses exclusively 2MB pages */
+	if (pde & (1ULL << 7)) { /* PSE (Page Size Extension) for 2MB pages */
+		hpa_base = pde & 0x000FFFFFFFFE0000ULL; /* 2MB base mask (Bits 51:21) */
+		return hpa_base | (gpa & ((2ULL << 20) - 1)); /* Kalan 21 bit offset */
+	} else {
+		/* Fallback for 4KB pages in case the identity map gets rebuilt with them */
+		int pti = (gpa >> 12) & 0x1FF;
+		u64 pt_phys = pde & 0x000FFFFFFFFFF000ULL;
+		u64 *pt, pte;
+		
+		if (!pt_phys || !pfn_valid(pt_phys >> PAGE_SHIFT)) return 0;
+		pt = (u64 *)phys_to_virt(pt_phys);
+		pte = pt[pti];
+		if (!(pte & 1)) return 0;
+		return (pte & 0x000FFFFFFFFFF000ULL) | (gpa & 0xFFF); /* 4KB offset */
+	}
+}
+
+/*
  * npt_hook_add_watch - Belirtilen GPA aralığını izleme listesine ekle
  * @ctx: NPT context (sayfa tablosu değişiklikleri için)
  * @gpa_start: İzlenecek bölgenin başlangıç adresi

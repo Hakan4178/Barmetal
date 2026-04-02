@@ -131,7 +131,8 @@ static int ring_write_nofault(struct svm_trace_ring *r, u64 offset, const void *
  * can reverse if it needs chronological order, but capturing them in MSR order
  * ensures we never miss any entry regardless of how fast the guest runs.
  */
-void svm_trace_emit_lbr(u64 cr3, u64 rip, u64 br_from, u64 br_to)
+void svm_trace_emit_lbr(u64 cr3, u64 rip, u64 br_from, u64 br_to,
+			const u8 *insn_buf, u32 insn_len)
 {
 	struct svm_trace_entry hdr;
 	struct svm_lbr_pair lbr[AMD_LBR_STACK_DEPTH];
@@ -144,6 +145,10 @@ void svm_trace_emit_lbr(u64 cr3, u64 rip, u64 br_from, u64 br_to)
 
 	memset(&hdr, 0, sizeof(hdr));
 	memset(lbr, 0, sizeof(lbr));
+
+	/* Cap instruction length to something sane */
+	if (insn_len > 32)
+		insn_len = 32;
 
 	/* 
 	 * Telemetry Resilience: 
@@ -176,14 +181,24 @@ void svm_trace_emit_lbr(u64 cr3, u64 rip, u64 br_from, u64 br_to)
 	hdr.guest_cr3 = cr3;
 	hdr.guest_rip = rip;
 	hdr.fault_gpa = 0;
-	hdr.data_size = 0;
+	hdr.data_size = insn_len;
 	memcpy(hdr.lbr, lbr, sizeof(lbr));
 
-	raw_spin_lock_irqsave(&trace_write_lock, flags);
-	offset = ring_reserve(&svm_tring, sizeof(hdr));
-	ring_write(&svm_tring, offset, &hdr, sizeof(hdr));
-	atomic64_add(sizeof(hdr), &svm_tring.commit_idx);
-	raw_spin_unlock_irqrestore(&trace_write_lock, flags);
+	{
+		u32 total = sizeof(hdr) + insn_len;
+
+		raw_spin_lock_irqsave(&trace_write_lock, flags);
+		offset = ring_reserve(&svm_tring, total);
+		ring_write(&svm_tring, offset, &hdr, sizeof(hdr));
+
+		if (insn_len > 0 && insn_buf) {
+			u64 data_off = (offset + sizeof(hdr)) % svm_tring.size;
+			ring_write(&svm_tring, data_off, insn_buf, insn_len);
+		}
+
+		atomic64_add(total, &svm_tring.commit_idx);
+		raw_spin_unlock_irqrestore(&trace_write_lock, flags);
+	}
 
 	pr_info_once("[SVM_TRACE] First telemetry record (LBR Fallback: %s) emitted.\n",
 		     valid_count > 0 ? "YES" : "NO (RIP Only)");

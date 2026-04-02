@@ -1,6 +1,6 @@
 # Barmetal
 
-Devlog: Yaşasın Triple fault çözüldü yarı stabil modül yüklendi. Python tarafında analiz ve gizlilik eksikliği var.
+Devlog: Yaşasın Triple fault çözüldü yarı stabil modül yüklendi. Python tarafında analiz ve gizlilik eksikliği var. 1 hafta ara verdim sadece açık kapatma belki?
 
 Kapatılan açık sayısı:134
 

@@ -181,6 +181,9 @@ struct svm_context {
   u64 session_cr3;
   int last_cpu;
 
+  /* [PHASE 17 V2] Shadow Debug Control */
+  u64 shadow_dbgctl;
+
   /* Gerekli: Kapsamdan Cikinca Yok Olmamasi İcin Guest GPR'ler */
   struct guest_regs gregs;
 };
@@ -239,8 +242,10 @@ void raw_cr3_flush(void);
 /* tsc_stealth.c */
 u64 vmrun_tsc_compensated(struct svm_context *ctx);
 void tsc_offset_reset(void);
+u64 tsc_jitter(u64 min, u64 max);
 
-/* Prototypes moved to npt_walk.h */
+/* Prototypes moved to npt_walk.h and svm_npt_hook.c */
+u64 npt_get_hpa(struct npt_context *ctx, u64 gpa);
 
 /* snapshot.c */
 int build_snapshot_for_task(struct snap_context *snap,

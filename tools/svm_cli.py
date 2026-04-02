@@ -279,7 +279,7 @@ def trace_reader_proc(trace_file, q_out):
                     lbr_raw   = unpacked[9:]
                     
                     if ev_type == 1:  # LBR
-                        total_expected = ENTRY_SIZE
+                        total_expected = ENTRY_SIZE + data_size
                     elif ev_type == 2:  # MUT (DIRTY PAGE)
                         if data_size > 16384:
                             cbuf.consume(1)
@@ -302,8 +302,13 @@ def trace_reader_proc(trace_file, q_out):
                             if frm and to:
                                 branches.append((frm, to))
                         
+                        # Extract inline instruction bytes if present
+                        insn_bytes = b''
+                        if data_size > 0:
+                            insn_bytes = bytes(cur_view[ENTRY_SIZE:ENTRY_SIZE + data_size])
+                        
                         try:
-                            q_out.put_nowait(('LBR', tsc, branches, rip))
+                            q_out.put_nowait(('LBR', tsc, branches, rip, insn_bytes))
                         except Exception: pass
                     
                     elif ev_type == 2:  # DIRTY PAGE
@@ -438,19 +443,23 @@ class LiveDashboard:
             if msg[0] == 'DROP':
                 self.stats["drops"] += 1
             elif msg[0] == 'LBR':
-                _, tsc, branches, rip = msg
-                self.stats["lbr"] += max(1, len(branches))
+                _, tsc, branches, rip, insn_bytes = msg
+                self.stats["lbr"] += 1
                 
-                if not branches:
-                    self.recent_branches.append((rip, rip, False, 'RIP'))
-                else:
+                # Disassemble inline instruction bytes at RIP
+                asm_str = ""
+                if insn_bytes and self.md:
+                    asm_str = self.disassemble(insn_bytes, rip)
+                
+                if branches:
                     for frm, to in branches:
-                        to_page = to & 0xFFFFFFFFFFFFF000
-                        is_dirty = to_page in self.dirty_pages
-                        self.recent_branches.append((frm, to, is_dirty, 'LBR'))
+                        is_dirty = (frm & 0xFFFFFFFFFFFFF000) in self.dirty_pages
+                        self.recent_branches.append((frm, to, is_dirty, 'LBR', asm_str))
                         if self.log_file:
                             dirty_str = " [DIRTY EXEC!]" if is_dirty else ""
                             self.session_log.append(f"[LBR] TSC: {tsc} | 0x{frm:016x} -> 0x{to:016x}{dirty_str}")
+                else:
+                    self.recent_branches.append((rip, 0, False, 'RIP', asm_str))
             elif msg[0] == 'MUT':
                 _, tsc, cr3, rip, gpa, data = msg
                 self.stats["dirty"] += 1
@@ -468,7 +477,10 @@ class LiveDashboard:
                                 f.write(data)
                         except: pass
                 
-                asm_str = self.disassemble(data, gpa)
+                # 4KB'lık sayfanın neresinde execute/write yapıldığını bul (RIP'nin offset'i)
+                offset = rip & 0xFFF
+                target_gpa = page_gpa | offset
+                asm_str = self.disassemble(data[offset:offset+32], target_gpa)
                 
                 self.recent_mutations.appendleft({
                     'gpa': gpa,
@@ -543,7 +555,7 @@ class LiveDashboard:
         
         max_rows = panel_height - 1
         for i, branch in enumerate(recent_list[:max_rows]):
-            frm, to, is_dirty, src = branch
+            frm, to, is_dirty, src, asm_str = branch
             row = panel_start_row + 1 + i
             
             # Tree connector
@@ -553,15 +565,25 @@ class LiveDashboard:
             if src == 'RIP':
                 # Single RIP point (no LBR data)
                 self._safe_addstr(row, 4, f"0x{frm:012x}", curses.color_pair(1))
-                self._safe_addstr(row, 19, " [EXEC]", curses.color_pair(3) | curses.A_DIM)
+                self._safe_addstr(row, 19, " [EXEC] ", curses.color_pair(3) | curses.A_DIM)
+                if asm_str and asm_str not in ('[NO_CAPSTONE]', '[DATA/INVALID]'):
+                    self._safe_addstr(row, 27, asm_str[:mid_x - 29], curses.color_pair(2))
             else:
                 # Full LBR branch pair
                 self._safe_addstr(row, 4, f"0x{frm:012x}", curses.color_pair(1))
                 self._safe_addstr(row, 17, " → ", curses.A_DIM)
                 self._safe_addstr(row, 20, f"0x{to:012x}", curses.color_pair(2))
                 
+                offset = 35
                 if is_dirty:
-                    self._safe_addstr(row, 35, " [ANOMALY]", curses.color_pair(5) | curses.A_BOLD)
+                    self._safe_addstr(row, offset, " [ANOMALY]", curses.color_pair(5) | curses.A_BOLD)
+                    offset += 10
+                
+                if asm_str and asm_str not in ('[NO_CAPSTONE]', '[DATA/INVALID]'):
+                    # Show the instruction at VMEXIT next to the branches
+                    space_left = mid_x - offset - 2
+                    if space_left > 5:
+                        self._safe_addstr(row, offset, f" {asm_str}"[:space_left], curses.color_pair(3))
         
         if not recent_list:
             self._safe_addstr(panel_start_row + 2, 3, "Waiting for sync data...", curses.color_pair(1) | curses.A_DIM)

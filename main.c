@@ -165,6 +165,7 @@ int vmcb_prepare_npt(struct svm_context *ctx, u64 g_rip, u64 g_rsp, u64 g_cr3)
 		MSRPM_SET_RD(msrpm, MSRPM_BASE_LOW, 0x30B); /* IA32_FIXED_CTR2: rdmsr */
 		MSRPM_SET_RW(msrpm, MSRPM_BASE_LOW, 0x38D); /* IA32_PERF_FIXED_CTR_CTRL: rd+wr */
 		MSRPM_SET_RW(msrpm, MSRPM_BASE_LOW, 0x38F); /* IA32_PERF_GLOBAL_CTRL: rd+wr */
+		MSRPM_SET_RW(msrpm, MSRPM_BASE_LOW, 0x1D9); /* IA32_DEBUGCTL: shadow debugctl */
 
 		/* ── Bölge 1: MSR 0xC000xxxx ── */
 		MSRPM_SET_RW(msrpm, MSRPM_BASE_C000, 0x81);  /* STAR: rd+wr */
@@ -214,13 +215,17 @@ int vmcb_prepare_npt(struct svm_context *ctx, u64 g_rip, u64 g_rsp, u64 g_cr3)
 	vmcb->control.virt_ext |= LBR_CTL_ENABLE_MASK; // LBR Virtualization (save/restore)
 
 	/*
-	 * Phase 17 (LBR Illusion): LBR recording NO LONGER forced.
-	 * If we force DBGCTL.LBR (bit 0) to 1, Anti-Cheats (VMP/EAC) reading 
-	 * MSR_DEBUGCTL (0x1D9) will detect the anomaly and ban the user.
-	 * LBR Virtualization handles everything natively. The guest remains blind.
+	 * Phase 17 V2 (Shadow LBR Illusion): 
+	 * Anti-Cheats (VMP/EAC) reading MSR_DEBUGCTL (0x1D9) will detect anomaly 
+	 * if LBR bit is 1. We now use a Shadow DEBUGCTL.
+	 * Hardware LBR is FORCED ON for tracing, but Guest reads/writes 
+	 * are intercepted and it sees the LBR disabled shadow value.
 	 */
 	rdmsrl(0x1D9, msr_val);
-	vmcb->save.dbgctl = msr_val & 0xFFFFFFFE; /* Disable LBR trace securely */
+	vmcb->save.dbgctl = msr_val | 1ULL; /* Force LBR ON in hardware */
+	if (ctx) {
+		ctx->shadow_dbgctl = msr_val & 0xFFFFFFFEULL; /* Guest sees LBR disabled */
+	}
 
 	/* First VMRUN: clean=0 forces full load. Subsequent runs use STABLE. */
 	vmcb->control.clean = 0;
@@ -420,7 +425,7 @@ static void free_percpu_vmcbs(void)
 {
 	int cpu;
 
-	for_each_online_cpu(cpu) {
+	for_each_possible_cpu(cpu) {
 		struct percpu_vmcb *pv = per_cpu_ptr(&cpu_vmcbs, cpu);
 
 		if (pv->vmcb) {

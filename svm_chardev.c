@@ -323,9 +323,25 @@ static long svm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	}
 }
 
+static int ntp_sync_release(struct inode *inode, struct file *file)
+{
+	/*
+	 * Eğer bu file descriptor'ı kapatan process Matrix'in asıl sahibiyse ve
+	 * hala active durumda kaldıysa (örneğin Syscall Trampoline'dan return yerine
+	 * direkt native exit() yaptıysa veya SIGKILL yediyse), kilidi zorla aç.
+	 */
+	if (atomic_read(&matrix_active) == 1 && matrix_owner_pid == current->pid) {
+		atomic_set(&matrix_active, 0);
+		wake_up_interruptible(&svm_trace_wq);
+		pr_info("[NTP_SYNC] Zombie Matrix session cleaned up for PID: %d\n", current->pid);
+	}
+	return 0;
+}
+
 static const struct file_operations svm_fops = {
 	.owner = THIS_MODULE,
 	.unlocked_ioctl = svm_ioctl,
+	.release = ntp_sync_release,
 	/* .compat_ioctl bilerek EKLENMEDİ (32-bit zafiyet tıkacı) */
 };
 

@@ -75,24 +75,6 @@
  * ═══════════════════════════════════════════════════════════════════════════
  */
 
-static DEFINE_PER_CPU(u64, jitter_state);
-
-static inline u64 tsc_jitter(u64 min, u64 max)
-{
-	u64 *state = this_cpu_ptr(&jitter_state);
-
-	if (!*state)
-		*state = 0x5DEECE66DULL ^ rdtsc();
-
-	/* LCG: state = state * 6364136223846793005 + 1442695040888963407 */
-	*state = *state * 6364136223846793005ULL + 1442695040888963407ULL;
-
-	/* Defensive: prevent UB if caller passes min > max */
-	if (unlikely(min >= max))
-		return min;
-
-	return min + ((*state >> 33) % (max - min + 1));
-}
 
 /* ═══════════════════════════════════════════════════════════════════════════
  *  CPUID Handler — Anti-Detection Core
@@ -103,53 +85,6 @@ static inline u64 tsc_jitter(u64 min, u64 max)
  * ═══════════════════════════════════════════════════════════════════════════
  */
 
-/*
- * Securely translate a Guest Physical Address (GPA) to a Host Physical 
- * Address (HPA) by walking the NPT map.
- */
-static u64 npt_get_hpa(struct npt_context *ctx, u64 gpa)
-{
-	u64 *pml4 = ctx->pml4;
-	int pml4i = (gpa >> 39) & 0x1FF;
-	int pdpti = (gpa >> 30) & 0x1FF;
-	int pdi   = (gpa >> 21) & 0x1FF;
-	u64 pdpt_phys, *pdpt, pd_phys, *pd, pde, hpa_base;
-
-	if (!pml4) return 0;
-	
-	/* 1. PML4 -> PDPT */
-	if (!(pml4[pml4i] & 1)) return 0; /* Present bit check */
-	pdpt_phys = pml4[pml4i] & 0x000FFFFFFFFFF000ULL; /* NX (bit 63) ve reserved bit mask */
-	if (!pdpt_phys || !pfn_valid(pdpt_phys >> PAGE_SHIFT)) return 0;
-	pdpt = (u64 *)phys_to_virt(pdpt_phys); /* Pointer cast aritmetiği koruması */
-
-	/* 2. PDPT -> PD */
-	if (!(pdpt[pdpti] & 1)) return 0;
-	pd_phys = pdpt[pdpti] & 0x000FFFFFFFFFF000ULL;
-	if (!pd_phys || !pfn_valid(pd_phys >> PAGE_SHIFT)) return 0;
-	pd = (u64 *)phys_to_virt(pd_phys);
-
-	/* 3. PD -> PTE veya 2MB Page */
-	pde = pd[pdi];
-	if (!(pde & 1)) return 0; /* Present bit = 0 (sayfa NPT'de yok) */
-
-	/* Active SVM Identity Map currently uses exclusively 2MB pages */
-	if (pde & (1ULL << 7)) { /* PSE (Page Size Extension) for 2MB pages */
-		hpa_base = pde & 0x000FFFFFFFFE0000ULL; /* 2MB base mask (Bits 51:21) */
-		return hpa_base | (gpa & ((2ULL << 20) - 1)); /* Kalan 21 bit offset */
-	} else {
-		/* Fallback for 4KB pages in case the identity map gets rebuilt with them */
-		int pti = (gpa >> 12) & 0x1FF;
-		u64 pt_phys = pde & 0x000FFFFFFFFFF000ULL;
-		u64 *pt, pte;
-		
-		if (!pt_phys || !pfn_valid(pt_phys >> PAGE_SHIFT)) return 0;
-		pt = (u64 *)phys_to_virt(pt_phys);
-		pte = pt[pti];
-		if (!(pte & 1)) return 0;
-		return (pte & 0x000FFFFFFFFFF000ULL) | (gpa & 0xFFF); /* 4KB offset */
-	}
-}
 
 static void handle_cpuid(struct vmcb *vmcb, struct guest_regs *regs)
 {
@@ -197,8 +132,9 @@ static void handle_cpuid(struct vmcb *vmcb, struct guest_regs *regs)
  * ═══════════════════════════════════════════════════════════════════════════
  */
 
-static void handle_msr(struct vmcb *vmcb, struct guest_regs *regs)
+static void handle_msr(struct svm_context *ctx, struct guest_regs *regs)
 {
+	struct vmcb *vmcb = ctx->vmcb;
 	u32 msr_num = (u32)regs->rcx;
 	bool is_write = vmcb->control.exit_info_1 & 1;
 	u64 val;
@@ -229,6 +165,12 @@ static void handle_msr(struct vmcb *vmcb, struct guest_regs *regs)
 					   msr_num, wval, vmcb->save.cr3);
 			/* Native execute: TLS/SWAPGS bozulmamalı */
 			wrmsrq(msr_num, wval);
+			break;
+
+		case 0x1D9: /* IA32_DEBUGCTL (Shadowing) */
+			ctx->shadow_dbgctl = wval;
+			/* Hardware'da LBR (bit 0) zorla açık kalır */
+			vmcb->save.dbgctl = wval | 1ULL;
 			break;
 
 		default:
@@ -298,19 +240,9 @@ static void handle_msr(struct vmcb *vmcb, struct guest_regs *regs)
 			val = 0;
 		break;
 
-	/* ── BTS: Block Branch Trace Store ── */
+	/* ── Shadow DEBUGCTL ── */
 	case 0x1D9: /* IA32_DEBUGCTL */
-		/*
-		 * BTS (Branch Trace Store) can record VMRUN branch target.
-		 * We intercept reads to return value with BTS bits cleared,
-		 * and intercept writes to silently ignore BTS enable.
-		 */
-		if (rdmsrq_safe(msr_num, &val))
-			val = 0;
-		val &= ~(3ULL);	     /* Clear bits 0-1 (LBR, BTF) */
-		val &= ~(1ULL << 6); /* Clear bit 6 (TR — trace messages) */
-		val &= ~(1ULL << 7); /* Clear bit 7 (BTS — branch trace store) */
-		val &= ~(1ULL << 9); /* Clear bit 9 (BTS_OFF_OS) */
+		val = ctx->shadow_dbgctl;
 		break;
 
 	default:
@@ -518,7 +450,7 @@ int svm_run_guest(struct svm_context *ctx, struct guest_regs *regs)
 		goto out;
 
 	case SVM_EXIT_MSR:
-		handle_msr(ctx->vmcb, regs);
+		handle_msr(ctx, regs);
 		break;
 
 	case SVM_EXIT_IOIO:
@@ -626,7 +558,7 @@ int svm_run_guest(struct svm_context *ctx, struct guest_regs *regs)
 								ctx->vmcb->save.rip += insn_len;
 
 							/* Telemetry trace (0, 0 since it's just sequential emulation unless branch) */
-							svm_trace_emit_lbr(ctx->vmcb->save.cr3, ctx->vmcb->save.rip, 0, 0);
+							svm_trace_emit_lbr(ctx->vmcb->save.cr3, ctx->vmcb->save.rip, 0, 0, insn_buf, 15);
 
 							/* Enforce TSC Compensation / Drift Control before seamless resume */
 							u64 npf_exit_tsc = rdtsc();
@@ -649,17 +581,17 @@ int svm_run_guest(struct svm_context *ctx, struct guest_regs *regs)
 					int pdpti = (gpa >> 30) & 0x1FF;
 					int pdi = (gpa >> 21) & 0x1FF;
 
-					u64 pdpt_phys = pml4[pml4i] & ~0xFFFULL;
+					u64 pdpt_phys = pml4[pml4i] & 0x000FFFFFFFFFF000ULL;
 
 					if (!pdpt_phys || !pfn_valid(pdpt_phys >> PAGE_SHIFT))
 						goto skip_nx_rearm;
-					u64 *pdpt = phys_to_virt(pdpt_phys);
+					u64 *pdpt = (u64 *)phys_to_virt(pdpt_phys);
 
-					u64 pd_phys = pdpt[pdpti] & ~0xFFFULL;
+					u64 pd_phys = pdpt[pdpti] & 0x000FFFFFFFFFF000ULL;
 
 					if (!pd_phys || !pfn_valid(pd_phys >> PAGE_SHIFT))
 						goto skip_nx_rearm;
-					u64 *pd = phys_to_virt(pd_phys);
+					u64 *pd = (u64 *)phys_to_virt(pd_phys);
 
 					pd[pdi] &= ~NPT_NX; /* Geçici execute izni */
 				}
@@ -722,17 +654,17 @@ skip_nx_rearm:
 				int pdpti = (gpa >> 30) & 0x1FF;
 				int pdi = (gpa >> 21) & 0x1FF;
 
-				u64 pdpt_phys = pml4[pml4i] & ~0xFFFULL;
+				u64 pdpt_phys = pml4[pml4i] & 0x000FFFFFFFFFF000ULL;
 
 				if (!pdpt_phys || !pfn_valid(pdpt_phys >> PAGE_SHIFT))
 					goto skip_rearm;
-				u64 *pdpt = phys_to_virt(pdpt_phys);
+				u64 *pdpt = (u64 *)phys_to_virt(pdpt_phys);
 
-				u64 pd_phys = pdpt[pdpti] & ~0xFFFULL;
+				u64 pd_phys = pdpt[pdpti] & 0x000FFFFFFFFFF000ULL;
 
 				if (!pd_phys || !pfn_valid(pd_phys >> PAGE_SHIFT))
 					goto skip_rearm;
-				u64 *pd = phys_to_virt(pd_phys);
+				u64 *pd = (u64 *)phys_to_virt(pd_phys);
 
 				pd[pdi] |= NPT_WRITE;
 			}
@@ -913,14 +845,14 @@ skip_rearm:
 				int pdpti = (g >> 30) & 0x1FF;
 				int pdi = (g >> 21) & 0x1FF;
 
-				u64 pdpt_phys = pml4[pml4i] & ~0xFFFULL;
+				u64 pdpt_phys = pml4[pml4i] & 0x000FFFFFFFFFF000ULL;
 
 				if (pdpt_phys && pfn_valid(pdpt_phys >> PAGE_SHIFT)) {
-					u64 *pdpt = phys_to_virt(pdpt_phys);
-					u64 pd_phys = pdpt[pdpti] & ~0xFFFULL;
+					u64 *pdpt = (u64 *)phys_to_virt(pdpt_phys);
+					u64 pd_phys = pdpt[pdpti] & 0x000FFFFFFFFFF000ULL;
 
 					if (pd_phys && pfn_valid(pd_phys >> PAGE_SHIFT)) {
-						u64 *pd = phys_to_virt(pd_phys);
+						u64 *pd = (u64 *)phys_to_virt(pd_phys);
 
 						/* Phase 21: Correctly re-arm NX or Write based on fault type */
 						if (ctx->pending_rearm_nx) {
@@ -953,7 +885,25 @@ skip_rearm:
 
 	/* ── Phase 2: LBR Chronological Drain ── */
 	pr_info_once("[VMEXIT] Telemetry drain reached (exit_code=0x%llx, ret=%d)\n", exit_code, ret);
-	svm_trace_emit_lbr(ctx->vmcb->save.cr3, ctx->vmcb->save.rip, ctx->vmcb->save.br_from, ctx->vmcb->save.br_to);
+	{
+		u8 lbr_insn[32] = {0};
+		u32 lbr_insn_len = 0;
+		u64 lbr_hpa = npt_get_hpa(&ctx->npt, ctx->vmcb->save.rip);
+
+		if (lbr_hpa && pfn_valid(lbr_hpa >> PAGE_SHIFT)) {
+			void *lbr_hva = phys_to_virt(lbr_hpa);
+			size_t avail = PAGE_SIZE - (lbr_hpa & ~PAGE_MASK);
+
+			if (avail > sizeof(lbr_insn))
+				avail = sizeof(lbr_insn);
+			if (!copy_from_kernel_nofault(lbr_insn, lbr_hva, avail))
+				lbr_insn_len = (u32)avail;
+		}
+
+		svm_trace_emit_lbr(ctx->vmcb->save.cr3, ctx->vmcb->save.rip,
+				   ctx->vmcb->save.br_from, ctx->vmcb->save.br_to,
+				   lbr_insn, lbr_insn_len);
+	}
 
 	/* ── TSC Compensation (runs with IRQs ENABLED — safe, pinned to CPU 0) ── */
 	{
