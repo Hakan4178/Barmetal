@@ -40,12 +40,12 @@ int init_syscall_spoofing(void) {
 
     int ret = register_kretprobe(&getpid_kprobe);
     if (ret < 0) {
-        pr_err("[SPOOF] __x64_sys_getpid Kprobe hook failed: %d\n", ret);
+        pr_err("[THERMAL] __x64_sys_getpid Kprobe hook failed: %d\n", ret);
         return ret;
     }
     
     kprobe_active = true;
-    pr_info("[SPOOF] Phase 16 Fallback: __x64_sys_getpid hooked natively for Matrix tracking.\n");
+    pr_info("[THERMAL] Phase 16 Fallback: __x64_sys_getpid hooked natively for Matrix tracking.\n");
     return 0;
 }
 
@@ -53,6 +53,6 @@ void cleanup_syscall_spoofing(void) {
     if (kprobe_active) {
         unregister_kretprobe(&getpid_kprobe);
         kprobe_active = false;
-        pr_info("[SPOOF] Phase 16 Fallback (Kprobe) cleanup done.\n");
+        pr_info("[THERMAL] Phase 16 Fallback (Kprobe) cleanup done.\n");
     }
 }

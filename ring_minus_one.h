@@ -92,7 +92,13 @@
 #define VMCB_CLEAN_STABLE                                                      \
   (VMCB_CLEAN_INTERCEPTS | VMCB_CLEAN_IOPM | VMCB_CLEAN_MSRPM |                \
    VMCB_CLEAN_NP | VMCB_CLEAN_CRX | VMCB_CLEAN_DRX | VMCB_CLEAN_DT |           \
-   VMCB_CLEAN_SEG | VMCB_CLEAN_CR2 | VMCB_CLEAN_LBR)
+   VMCB_CLEAN_SEG | VMCB_CLEAN_CR2 | VMCB_CLEAN_LBR | VMCB_CLEAN_AVIC)
+
+/*
+ * Phase 26: VMCB_CLEAN_ALL — Every bit set. Used by Assembly fast-path
+ * when NO fields were touched (unwatched NPF passthrough).
+ */
+#define VMCB_CLEAN_ALL 0xFFFFFFFFU
 
 /* ── Moved to npt_walk.h ── */
 
@@ -259,7 +265,7 @@ extern struct snap_context *g_snap;
 bool svm_supported(void);
 int resolve_hidden_symbols(void);
 void vmrun_safe(u64 vmcb_pa);
-void vmrun_with_regs(u64 vmcb_pa, struct guest_regs *regs);
+void vmrun_with_regs(u64 vmcb_pa, struct guest_regs *regs, struct vmcb *vmcb_va);
 void raw_cr3_flush(void);
 
 /* tsc_stealth.c */

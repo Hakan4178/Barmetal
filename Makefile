@@ -52,12 +52,7 @@ ccflags-y += $(call cc-option,-Wlogical-op)
 ccflags-y += $(call cc-option,-Wduplicated-cond)
 ccflags-y += $(call cc-option,-Wjump-misses-init)
 
-# ─── Information Leak (Uninitialized Var) Koruması ───
-# Tanımlanan tüm yerel C değişkenlerini sıfırlar. Leak engeller.
-ccflags-y += $(call cc-option,-ftrivial-auto-var-init=zero)
 
-# ─── Stack Protector / OOB Kalkanı ───
-ccflags-y += -fstack-protector-strong
 # Daha küçük array/buffer'ları (4 byte) bile guard aralığına alır:
 ccflags-y += $(call cc-option,--param=ssp-buffer-size=4)
 
@@ -77,7 +72,7 @@ OBJECT_FILES_NON_STANDARD := y
 all:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
 	@echo "[*] Stripping debug symbols for maximum Stealth and L1 Cache fit..."
-	@strip --strip-unneeded ring_minus_one.ko
+	@strip --strip-debug ring_minus_one.ko
 	@echo "[*] Compiling User-Space Tools..."
 	@gcc -shared -fPIC -nostdlib matrix_hook.c -o matrix_hook.so
 	@gcc svm_run.c -o svm_run

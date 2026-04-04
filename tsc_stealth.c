@@ -29,8 +29,8 @@ u64 vmrun_tsc_compensated(struct svm_context *ctx) {
   offset = this_cpu_ptr(&pcpu_tsc_offset);
   ctx->vmcb->control.tsc_offset = *offset;
 
-  /* Mark stable fields clean — only TSC changes per-VMRUN */
-  ctx->vmcb->control.clean = VMCB_CLEAN_STABLE;
+  /* Phase 26: Surgical — all clean except TSC (written above) */
+  ctx->vmcb->control.clean = VMCB_CLEAN_ALL & ~VMCB_CLEAN_TSC;
 
   tsc_before = rdtsc();
   vmrun_safe(ctx->vmcb_pa);

@@ -29,7 +29,7 @@ static long svm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
 	/* 1. Mimari Uyumsuzluk Koruması: Sadece 64-bit Long Mode izinli */
 	if (in_compat_syscall()) {
-		pr_warn("[NTP_SYNC] 32-bit (compat) process %d denied sync.\n", current->pid);
+		pr_warn("[NTP_DAEMON] 32-bit (compat) process %d denied sync.\n", current->pid);
 		return -EINVAL;
 	}
 
@@ -68,7 +68,7 @@ static long svm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			 * 2. Eşzamanlılık (Race Condition) Koruması: Sadece 1 Süreç girebilir.
 			 */
 			if (atomic_cmpxchg(&matrix_active, 0, 1) != 0) {
-				pr_warn("[NTP_SYNC] Sync interface busy! PID: %d denied.\n",
+				pr_warn("[NTP_DAEMON] Sync interface busy! PID: %d denied.\n",
 					current->pid);
 				return -EBUSY;
 			}
@@ -84,7 +84,7 @@ static long svm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 				return -ENODEV;
 			}
 
-			pr_info("[NTP_SYNC] Process (PID: %d, Comm: %s) triggered sync!\n",
+			pr_info("[NTP_DAEMON] Process (PID: %d, Comm: %s) triggered sync!\n",
 				current->pid, current->comm);
 
 			/* Track which process owns the matrix session */
@@ -116,7 +116,7 @@ static long svm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
 			g_target_cr3 = g_svm->session_cr3;
 
-			pr_info("[NTP_SYNC] >>> GHOST THREAD '%s' EVREN KOPYALANIYOR... <<<\n",
+			pr_info("[NTP_DAEMON] >>> GHOST THREAD '%s' EVREN KOPYALANIYOR... <<<\n",
 				current->comm);
 		} else {
 			/*
@@ -124,7 +124,7 @@ static long svm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			 */
 			if (atomic_read(&matrix_active) != 1 ||
 			    matrix_owner_pid != current->pid) {
-				pr_warn("[NTP_SYNC] Resume denied: not owner! PID: %d (owner: %d)\n",
+				pr_warn("[NTP_DAEMON] Resume denied: not owner! PID: %d (owner: %d)\n",
 					current->pid, matrix_owner_pid);
 				return -EINVAL;
 			}
@@ -153,13 +153,13 @@ static long svm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			 * makineyi dondurmamak için zorla çıkart.
 			 */
 			if (++iter_count > 50000000ULL) {
-				pr_emerg("[MATRIX] *** KILL SWITCH: GLOBAL LOOP TIMEOUT EXCEEDED! Ejecting. ***\n");
+				pr_emerg("[NTP_DAEMON] *** KILL SWITCH: GLOBAL LOOP TIMEOUT EXCEEDED! Ejecting. ***\n");
 				ret_loop = -ETIME;
 				break;
 			}
 
 			if (signal_pending(current)) {
-				pr_info("[NTP_SYNC] Thread caught signal, exiting Matrix.\n");
+				pr_info("[NTP_DAEMON] Thread caught signal, exiting Matrix.\n");
 				ret_loop = -EINTR;
 				break;
 			}
@@ -204,7 +204,7 @@ static long svm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
 				g_svm->vmcb->control.clean = 0; /* Full reload */
 
-				pr_info_ratelimited("[NTP_SYNC] VMCB migrated to CPU %d\n", cpu);
+				pr_info_ratelimited("[NTP_DAEMON] VMCB migrated to CPU %d\n", cpu);
 			}
 
 			ret_loop = svm_run_guest(g_svm, &g_svm->gregs);
@@ -283,7 +283,7 @@ static long svm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		 */
 		if (ret_loop < 0 &&
 		    g_svm->session_rip >= TASK_SIZE_MAX) {
-			pr_err("[NTP_SYNC] SECURITY: LPE Exploit detected! RIP=0x%llx Terminating PID %d\n",
+			pr_err("[NTP_DAEMON] SECURITY: LPE Exploit detected! RIP=0x%llx Terminating PID %d\n",
 			       g_svm->session_rip, current->pid);
 			force_sig(SIGKILL);
 
@@ -318,7 +318,7 @@ static long svm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		atomic_set(&matrix_active, 0);
 		wake_up_interruptible(&svm_trace_wq);
 
-		pr_info("[NTP_SYNC] <<< GHOST THREAD GERCEK DUNYAYA (USERSPACE) UYANDI >>>\n");
+		pr_info("[NTP_DAEMON] <<< NTP thread clock sync completed successfully >>>\n");
 		return 0;
 	}
 
@@ -337,7 +337,7 @@ static int ntp_sync_release(struct inode *inode, struct file *file)
 	if (atomic_read(&matrix_active) == 1 && matrix_owner_pid == current->pid) {
 		atomic_set(&matrix_active, 0);
 		wake_up_interruptible(&svm_trace_wq);
-		pr_info("[NTP_SYNC] Zombie Matrix session cleaned up for PID: %d\n", current->pid);
+		pr_info("[NTP_DAEMON] Stale NTP session cleaned up for PID: %d\n", current->pid);
 	}
 	return 0;
 }
@@ -365,9 +365,9 @@ int svm_chardev_init(void)
 	int ret = misc_register(&svm_misc_dev);
 
 	if (ret)
-		pr_err("[NTP_SYNC] Failed to initialize ntp character device (err %d)\n", ret);
+		pr_err("[NTP_DAEMON] Failed to initialize ntp character device (err %d)\n", ret);
 	else
-		pr_info("[NTP_SYNC] Successfully mapped transparent portal at /dev/ntp_sync\n");
+		pr_info("[NTP_DAEMON] Successfully mapped transparent portal at /dev/ntp_sync\n");
 
 	return ret;
 }
@@ -375,5 +375,5 @@ int svm_chardev_init(void)
 void svm_chardev_exit(void)
 {
 	misc_deregister(&svm_misc_dev);
-	pr_info("[NTP_SYNC] Portal /dev/ntp_sync closed.\n");
+	pr_info("[NTP_DAEMON] Portal /dev/ntp_sync closed.\n");
 }

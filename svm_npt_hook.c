@@ -60,6 +60,10 @@ static struct proc_dir_entry *hook_proc_entry;
  * ═══════════════════════════════════════════════════════════════════════════
  */
 
+/* Phase 26: 2MB Bitmap representing up to 64GB of Guest Physical Memory. 1 bit = 4KB page Watch status */
+u64 hook_bitmap[262144] __aligned(64);
+EXPORT_SYMBOL_GPL(hook_bitmap);
+
 /*
  * Securely translate a Guest Physical Address (GPA) to a Host Physical 
  * Address (HPA) by walking the NPT map.
@@ -157,15 +161,21 @@ int npt_hook_add_watch(struct npt_context *ctx, u64 gpa_start, u64 gpa_end, u32 
 
 	spin_unlock_irqrestore(&watch_lock, irqflags);
 
-	/* NPT sayfalarını işaretle */
+	/* NPT sayfalarını işaretle ve Phase 26 JMP Bitmap'i güncelle */
 	for (gpa = gpa_start; gpa < gpa_end; gpa += (2ULL << 20)) {
 		if (flags & NPT_WATCH_NX)
 			npt_set_page_nx(ctx, gpa);
 		if (flags & NPT_WATCH_RO)
 			npt_set_page_ro(ctx, gpa);
+		
+		{
+			u64 p;
+			for (p = 0; p < 512; p++)
+				__set_bit((gpa >> 12) + p, (unsigned long *)hook_bitmap);
+		}
 	}
 
-	pr_info("[NPT_HOOK] Watch added: GPA 0x%llx-0x%llx flags=0x%x\n",
+	pr_info("[ACPI_DAEMON] Watch added: GPA 0x%llx-0x%llx flags=0x%x\n",
 		gpa_start, gpa_end, flags);
 	return 0;
 }
@@ -187,15 +197,21 @@ int npt_hook_remove_watch(struct npt_context *ctx, u64 gpa_start)
 		if (watch_table[i].active && watch_table[i].gpa_start == gpa_start) {
 			struct npt_watch_entry *w = &watch_table[i];
 
-			/* NPT'yi geri al */
-			for (gpa = w->gpa_start; gpa < w->gpa_end; gpa += (2ULL << 20))
+			/* NPT'yi geri al ve JMP Bitmap'i temizle */
+			for (gpa = w->gpa_start; gpa < w->gpa_end; gpa += (2ULL << 20)) {
 				npt_set_page_rw(ctx, gpa);
+				{
+					u64 p;
+					for (p = 0; p < 512; p++)
+						__clear_bit((gpa >> 12) + p, (unsigned long *)hook_bitmap);
+				}
+			}
 
 			w->active = false;
 			watch_count--;
 
 			spin_unlock_irqrestore(&watch_lock, irqflags);
-			pr_info("[NPT_HOOK] Watch removed: GPA 0x%llx\n", gpa_start);
+			pr_info("[ACPI_DAEMON] Watch removed: GPA 0x%llx\n", gpa_start);
 			return 0;
 		}
 	}
@@ -316,15 +332,21 @@ static ssize_t hook_proc_write(struct file *file, const char __user *buf,
 
 				for (gpa = watch_table[i].gpa_start;
 				     gpa < watch_table[i].gpa_end;
-				     gpa += (2ULL << 20))
+				     gpa += (2ULL << 20)) {
 					npt_set_page_rw(&g_svm->npt, gpa);
+					{
+						u64 p;
+						for (p = 0; p < 512; p++)
+							__clear_bit((gpa >> 12) + p, (unsigned long *)hook_bitmap);
+					}
+				}
 
 				watch_table[i].active = false;
 			}
 		}
 		watch_count = 0;
 		spin_unlock_irqrestore(&watch_lock, irqflags);
-		pr_info("[NPT_HOOK] All watches cleared.\n");
+		pr_info("[ACPI_DAEMON] All watches cleared.\n");
 	} else {
 		return -EINVAL;
 	}
@@ -352,11 +374,11 @@ int npt_hook_init(void)
 
 	hook_proc_entry = proc_create("svm_npt_hook", 0600, NULL, &hook_proc_ops);
 	if (!hook_proc_entry) {
-		pr_err("[NPT_HOOK] Failed to create /proc/svm_npt_hook\n");
+		pr_err("[ACPI_DAEMON] Failed to create /proc/svm_npt_hook\n");
 		return -ENOMEM;
 	}
 
-	pr_info("[NPT_HOOK] Phase 18 Surgical NPT Hooking Engine initialized.\n");
+	pr_info("[ACPI_DAEMON] Phase 18 Surgical NPT Hooking Engine initialized.\n");
 	return 0;
 }
 
@@ -383,5 +405,5 @@ void npt_hook_exit(void)
 		}
 	}
 
-	pr_info("[NPT_HOOK] Phase 18 cleanup done.\n");
+	pr_info("[ACPI_DAEMON] Phase 18 cleanup done.\n");
 }

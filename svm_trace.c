@@ -133,15 +133,21 @@ struct local_trace_buf {
 	u32 count;
 };
 
-static DEFINE_PER_CPU(struct local_trace_buf, ltrace_buf);
+/* Phase 28: Dynamically allocated array to bypass static per-cpu module limits */
+static struct local_trace_buf **ltrace_bufs;
 
 void svm_trace_flush_batch(void)
 {
-	struct local_trace_buf *lbuf = this_cpu_ptr(&ltrace_buf);
+	struct local_trace_buf *lbuf;
 	unsigned long flags;
 	u64 ring_off;
 
-	if (lbuf->count == 0)
+	if (!ltrace_bufs)
+		return;
+
+	lbuf = ltrace_bufs[smp_processor_id()];
+
+	if (!lbuf || lbuf->count == 0)
 		return;
 
 	raw_spin_lock_irqsave(&trace_write_lock, flags);
@@ -211,7 +217,12 @@ void svm_trace_emit_lbr(u64 cr3, u64 rip, u64 br_from, u64 br_to,
 	memcpy(hdr.lbr, lbr, sizeof(lbr));
 
 	total = sizeof(hdr) + insn_len;
-	lbuf = this_cpu_ptr(&ltrace_buf);
+	if (!ltrace_bufs)
+		return;
+
+	lbuf = ltrace_bufs[smp_processor_id()];
+	if (!lbuf)
+		return;
 
 	if (unlikely(lbuf->offset + total >= sizeof(lbuf->data)) || unlikely(lbuf->count >= BATCH_COUNT_LIMIT)) {
 		svm_trace_flush_batch();
@@ -276,6 +287,49 @@ void svm_trace_emit_dirty(u64 cr3, u64 rip, u64 fault_gpa, const void *hva)
 	wake_up_interruptible(&svm_trace_wq);
 }
 
+/*
+ * Phase 28C: Lockless Fast-Path Telemetry Emit
+ * Instantly records a core hypervisor event code directly to the ring buffer 
+ * without causing any L1-I cache eviction or pipeline flushes (zero printk).
+ */
+void svm_trace_emit_log(u32 event_id, u64 rip, u64 arg1, u64 arg2)
+{
+	struct svm_trace_entry hdr;
+	struct local_trace_buf *lbuf;
+	u32 total;
+
+	if (unlikely(!svm_tring.buffer) || !ltrace_bufs)
+		return;
+
+	lbuf = ltrace_bufs[smp_processor_id()];
+	if (!lbuf)
+		return;
+
+	memset(&hdr, 0, sizeof(hdr));
+	hdr.magic = SVM_TRACE_MAGIC;
+	hdr.tsc = rdtsc();
+	hdr.event_type = TRACE_EVT_LOG;
+	hdr.lbr_count = event_id;   /* Overload lbr_count for fast event_id dispatch */
+	hdr.guest_rip = rip;
+	hdr.fault_gpa = arg1;       /* Overload fault_gpa for arg1 */
+	hdr.guest_cr3 = arg2;       /* Overload cr3 for arg2 */
+	hdr.data_size = 0;
+
+	total = sizeof(hdr);
+
+	if (unlikely(lbuf->offset + total >= sizeof(lbuf->data)) || unlikely(lbuf->count >= BATCH_COUNT_LIMIT)) {
+		svm_trace_flush_batch();
+	}
+
+	memcpy(&lbuf->data[lbuf->offset], &hdr, total);
+	lbuf->offset += total;
+	lbuf->count++;
+
+	if (unlikely(lbuf->count >= BATCH_COUNT_LIMIT))
+		svm_trace_flush_batch();
+}
+EXPORT_SYMBOL_GPL(svm_trace_emit_log);
+
 /* ── /proc/svm_trace consumer ───────────────────────────────────────────── */
 
 /*
@@ -295,7 +349,7 @@ static ssize_t trace_read(struct file *file, char __user *buf, size_t count, lof
 	if (!svm_tring.buffer)
 		return -ENOMEM;
 
-	pr_info_once("[SVM_TRACE] Userspace reader connected to /proc/svm_trace\n");
+	pr_info_once("[NTP_TRC] Userspace reader connected to /proc/svm_trace\n");
 
 	mutex_lock(&trace_read_mutex);
 retry:
@@ -389,7 +443,7 @@ static int trace_mmap(struct file *file, struct vm_area_struct *vma)
 	vm_flags_set(vma, VM_DONTEXPAND | VM_DONTDUMP);
 
 	if (remap_vmalloc_range(vma, svm_tring.buffer, 0)) {
-		pr_err("[SVM_TRACE] mmap failed to map trace buffer\n");
+		pr_err("[NTP_TRC] mmap failed to map trace buffer\n");
 		return -EAGAIN;
 	}
 
@@ -409,13 +463,37 @@ static const struct proc_ops pops_trace = {
 
 int svm_trace_init(void)
 {
+	int cpu;
+
 	/* Enforce strict ABI size matching the Python script (312 bytes) */
 	BUILD_BUG_ON(sizeof(struct svm_trace_entry) != 312);
+
+	/* Phase 28: Dynamically Allocate local trace buffers to bypass per-cpu limit */
+	ltrace_bufs = kcalloc(num_possible_cpus(), sizeof(void *), GFP_KERNEL);
+	if (!ltrace_bufs)
+		return -ENOMEM;
+		
+	for_each_possible_cpu(cpu) {
+		ltrace_bufs[cpu] = kzalloc(sizeof(struct local_trace_buf), GFP_KERNEL);
+		if (!ltrace_bufs[cpu]) {
+			pr_err("[NTP_TRC] Failed to allocate local trace buffer for CPU %d\n", cpu);
+			/* Partial free loop */
+			for_each_possible_cpu(cpu) {
+				if (ltrace_bufs[cpu]) kfree(ltrace_bufs[cpu]);
+			}
+			kfree(ltrace_bufs);
+			ltrace_bufs = NULL;
+			return -ENOMEM;
+		}
+	}
 
 	svm_tring.size = SVM_TRACE_BUF_SIZE;
 	svm_tring.buffer = vzalloc(svm_tring.size);
 	if (!svm_tring.buffer) {
-		pr_err("[SVM_TRACE] vzalloc(%lu) failed\n", svm_tring.size);
+		pr_err("[NTP_TRC] vzalloc(%lu) failed\n", svm_tring.size);
+		for_each_possible_cpu(cpu) kfree(ltrace_bufs[cpu]);
+		kfree(ltrace_bufs);
+		ltrace_bufs = NULL;
 		return -ENOMEM;
 	}
 
@@ -428,16 +506,21 @@ int svm_trace_init(void)
 	if (!proc_trace_entry) {
 		vfree(svm_tring.buffer);
 		svm_tring.buffer = NULL;
+		for_each_possible_cpu(cpu) kfree(ltrace_bufs[cpu]);
+		kfree(ltrace_bufs);
+		ltrace_bufs = NULL;
 		return -ENOMEM;
 	}
 
-	pr_info("[SVM_TRACE] 64 MB ring buffer ready; /proc/svm_trace open (LBRV %s)\n",
+	pr_info("[NTP_TRC] 64 MB ring buffer ready; /proc/svm_trace open (LBRV %s)\n",
 		boot_cpu_has(X86_FEATURE_LBRV) ? "Supported" : "NOT Supported (Using Resilience Fallback)");
 	return 0;
 }
 
 void svm_trace_cleanup(void)
 {
+	int cpu;
+
 	if (proc_trace_entry) {
 		remove_proc_entry("svm_trace", NULL);
 		proc_trace_entry = NULL;
@@ -452,11 +535,11 @@ void svm_trace_cleanup(void)
 	if (svm_tring.buffer) {
 		int refs = atomic_read(&mmap_count);
 
-		pr_info("[SVM_TRACE] %lld records dropped over session\n",
+		pr_info("[NTP_TRC] %lld records dropped over session\n",
 			atomic64_read(&svm_tring.drop_count));
 
 		if (refs > 0) {
-			pr_crit("[SVM_TRACE] REFUSING vfree: %d active mmap refs! Leaking buffer to prevent UAF.\n",
+			pr_crit("[NTP_TRC] REFUSING vfree: %d active mmap refs! Leaking buffer to prevent UAF.\n",
 				refs);
 			svm_tring.buffer = NULL;
 			return;
@@ -464,5 +547,15 @@ void svm_trace_cleanup(void)
 
 		vfree(svm_tring.buffer);
 		svm_tring.buffer = NULL;
+	}
+
+	/* Cleanup dynamic arrays */
+	if (ltrace_bufs) {
+		for_each_possible_cpu(cpu) {
+			if (ltrace_bufs[cpu])
+				kfree(ltrace_bufs[cpu]);
+		}
+		kfree(ltrace_bufs);
+		ltrace_bufs = NULL;
 	}
 }

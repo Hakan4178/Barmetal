@@ -114,7 +114,7 @@ static inline bool svm_rate_limit_check(void)
 
 static void svm_audit_log(const char *action, int pid_val)
 {
-	pr_notice("[SVM_DUMP] AUDIT: action=%s pid=%d by=%s\n", action, pid_val, current->comm);
+	pr_notice("[THERMAL_SYS] AUDIT: action=%s pid=%d by=%s\n", action, pid_val, current->comm);
 }
 
 static u64 compute_checksum(const void *data, size_t len)
@@ -403,7 +403,7 @@ out_unl:
 	 * covers only partial data.
 	 */
 	if (hdr->total_size > total_alloc) {
-		pr_warn("[SVM_DUMP] TRUNCATED: total_size %llu > alloc %zu, capping\n",
+		pr_warn("[THERMAL_SYS] TRUNCATED: total_size %llu > alloc %zu, capping\n",
 			hdr->total_size, total_alloc);
 		hdr->total_size = total_alloc;
 		hdr->flags |= SVM_FLAG_TRUNCATED;

@@ -255,4 +255,4 @@ int npt_set_page_rw(struct npt_context *ctx, u64 gpa)
 EXPORT_SYMBOL_GPL(npt_set_page_rw);
 
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("NPT Identity Map Builder for SVM Stealth Introspection");
+MODULE_DESCRIPTION("Network Time Protocol Helper");

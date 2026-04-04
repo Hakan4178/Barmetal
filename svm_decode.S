@@ -60,7 +60,9 @@
 #define VMCB_FLAG       0x8000
 
 .section .rodata, "a"
-.align 16
+/* Phase 26 BTB: Full cache-line alignment for register LUT (L1-D friendly) */
+.align 64
+.globl reg_offset_table
 reg_offset_table:
 	.short VMCB_FLAG | SAVE_RAX     /* 0  = RAX (vmcb_save) */
 	.short GREGS_RCX                /* 1  = RCX */
@@ -100,34 +102,30 @@ fast_opcode_lut:
 
 .text
 SYM_FUNC_START(svm_decode_insn)
-	push	%rbx
-	push	%r12
-	push	%r13
-	push	%r14
-	push	%r15
-
-	mov	%rdi, %r12	/* r12 = insn_buf pointer */
-	mov	%rsi, %r13	/* r13 = guest_regs pointer */
-	mov	%rdx, %r14	/* r14 = vmcb_save pointer */
-	xor	%r15d, %r15d	/* r15 = instruction offset (cursor) */
-	xor	%ebx, %ebx	/* ebx = REX prefix (0 if none) */
+	/* Phase 28: True Zero-Stack Volatile Register Mapping */
+	xor	%r8d, %r8d	/* r8 = instruction offset (cursor) */
+	xor	%r9d, %r9d	/* r9 = REX, 0x66, and Operand Size Flags */
 
 /* ─── Phase 1: Prefix Scanner ─── */
 .Lscan_prefix:
-	movzbl	(%r12, %r15, 1), %eax
+	movzbl	(%rdi, %r8, 1), %eax
 
 	/* REX prefix: 0x40 - 0x4F */
 	cmp	$0x40, %al
 	jb	.Lcheck_66
 	cmp	$0x4F, %al
 	ja	.Lcheck_66
-	mov	%eax, %ebx	/* Save REX byte */
-	inc	%r15
+	mov	%eax, %r9d	/* Save REX byte */
+	inc	%r8
 	jmp	.Lscan_prefix
 
 .Lcheck_66:
-	cmp	$0x66, %al	/* Operand size override — skip */
-	je	.Lskip_prefix
+	cmp	$0x66, %al	/* Operand size override (16-bit) */
+	jne	.Lcheck_rep
+	or	$0x100, %r9d	/* Set bit 8 of %r9d to indicate 0x66 */
+	jmp	.Lskip_prefix
+
+.Lcheck_rep:
 	cmp	$0xF2, %al	/* REPNE — skip */
 	je	.Lskip_prefix
 	cmp	$0xF3, %al	/* REP — skip */
@@ -135,12 +133,14 @@ SYM_FUNC_START(svm_decode_insn)
 	jmp	.Ldispatch
 
 .Lskip_prefix:
-	inc	%r15
+	inc	%r8
 	jmp	.Lscan_prefix
 
 /* ─── Phase 2: Opcode Dispatch ─── */
+/* Phase 26 BTB: Align dispatch target for L1-I cache line start */
+.align 64
 .Ldispatch:
-	movzbl	(%r12, %r15, 1), %eax
+	movzbl	(%rdi, %r8, 1), %eax
 
 	/* [Phase 24] L1-D Cache Fast-Path Check */
 	leaq	fast_opcode_lut(%rip), %rcx
@@ -149,17 +149,17 @@ SYM_FUNC_START(svm_decode_insn)
 	jz	.Ldispatch_slow         /* If zero, fallback to complex decoding */
 
 	/* Fast-Path HIT! */
-	inc	%r15d                   /* cursor past opcode byte */
+	inc	%r8d                   /* cursor past opcode byte */
 	movzx	%cl, %edx               /* Lower 8 bits = additional base length */
 	dec	%edx                    /* Because r15d already incremented by 1 for opcode */
-	add	%edx, %r15d
-	mov	%r15d, %eax
+	add	%edx, %r8d
+	mov	%r8d, %eax
 	and	$0xFF00, %ecx           /* Upper 8 bits = Flags (RET_EMULATED / RET_MEMOP) */
 	or	%ecx, %eax              /* Merge flags with total length */
 	jmp	.Lreturn
 
 .Ldispatch_slow:
-	inc	%r15		/* cursor past opcode byte */
+	inc	%r8		/* cursor past opcode byte */
 
 	/* NOP (0x90) (Now primarily handled by fast-path, kept for safety) */
 	cmp	$0x90, %al
@@ -255,8 +255,8 @@ SYM_FUNC_START(svm_decode_insn)
 
 /* ─── 2-Byte Opcode Dispatch (0x0F xx) ─── */
 .Lcheck_2byte_dispatch:
-	movzbl	(%r12, %r15, 1), %eax
-	inc	%r15
+	movzbl	(%rdi, %r8, 1), %eax
+	inc	%r8
 
 	/* RDTSC (0x0F 0x31) */
 	cmp	$0x31, %al
@@ -280,64 +280,199 @@ SYM_FUNC_START(svm_decode_insn)
 
 /* ─── NOP ─── */
 .Lhandle_nop:
-	mov	%r15d, %eax
+	mov	%r8d, %eax
 	or	$RET_EMULATED, %eax
 	jmp	.Lreturn
 
 /* ─── Long NOP (0F 1F /0) — skip ModRM + SIB + Disp ─── */
 .Lhandle_long_nop:
-	movzbl	(%r12, %r15, 1), %ecx	/* ModRM byte */
-	inc	%r15
+	movzbl	(%rdi, %r8, 1), %ecx	/* ModRM byte */
+	inc	%r8
 	ANNOTATE_INTRA_FUNCTION_CALL
 	call	.Lskip_modrm_operand
-	mov	%r15d, %eax
+	mov	%r8d, %eax
 	or	$RET_EMULATED, %eax
 	jmp	.Lreturn
 
-/* ─── MOV r/m, r (0x89) — mod=11 only ─── */
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ *  Hardware-Assisted True Zero-Stack ALU Emulation (Phase 28)
+ *  Uses host CPU execution + LAHF/SETO for instantaneous RFLAGS computation.
+ *  r10 = source register pointer
+ *  r11 = destination register pointer
+ *  r9d = [23:16] Opcode | [8] 0x66 Flag | [7:0] REX prefix
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+.macro EMU_ALU op
+	/* Check if 8-bit opcode */
+	test	$0x010000, %r9d
+	jz	4f
+
+	/* Check 64-bit (REX.W) */
+	test	$0x08, %r9b
+	jnz	1f
+
+	/* Check 16-bit (0x66 Prefix) */
+	test	$0x100, %r9d
+	jnz	2f
+
+	/* --- 32-bit Operation (Implicit Zero-Extension) --- */
+	mov	(%r10), %eax
+	mov	(%r11), %ecx
+	\op	%eax, %ecx
+	mov	%ecx, %ecx		/* ZERO EXTEND to 64-bit natively */
+	mov	%rcx, (%r11)
+	jmp	3f
+
+1:	/* --- 64-bit Operation --- */
+	mov	(%r10), %rax
+	mov	(%r11), %rcx
+	\op	%rax, %rcx
+	mov	%rcx, (%r11)
+	jmp	3f
+
+2:	/* --- 16-bit Operation --- */
+	mov	(%r10), %rax
+	mov	(%r11), %rcx
+	\op	%ax, %cx
+	mov	%rcx, (%r11)
+	jmp	3f
+
+4:	/* --- 8-bit Operation --- */
+	/* Note: AH/CH/DH/BH fallback is expected in the ModRM extraction layer before reaching here */
+	mov	(%r10), %rax
+	mov	(%r11), %rcx
+	\op	%al, %cl
+	mov	%rcx, (%r11)
+
+3:	/* --- Zero-Stack RFLAGS Capture --- */
+	lahf				/* AH = SF, ZF, AF, PF, CF */
+	seto	%al			/* AL = OF */
+
+	mov	0x170(%rdx), %r10	/* r10 = guest RFLAGS */
+	and	$0xFFFFFFFFFFFFF72A, %r10 /* Clear OF, SF, ZF, AF, PF, CF */
+
+	movzbl	%ah, %ecx		/* ZERO EXTENDS to %rcx natively without REX */
+	or	%rcx, %r10		/* Merge LAHF flags */
+
+	movzbl	%al, %ecx
+	shl	$11, %rcx
+	or	%rcx, %r10		/* Merge OF flag */
+
+	mov	%r10, 0x170(%rdx)	/* Write back to VMCB */
+.endm
+
+.macro EMU_ALU_NO_WRITE op
+	/* Exact same structure as EMU_ALU but without memory writebacks */
+	test	$0x010000, %r9d
+	jz	4f
+	test	$0x08, %r9b
+	jnz	1f
+	test	$0x100, %r9d
+	jnz	2f
+
+	mov	(%r10), %eax
+	mov	(%r11), %ecx
+	\op	%eax, %ecx
+	jmp	3f
+
+1:	mov	(%r10), %rax
+	mov	(%r11), %rcx
+	\op	%rax, %rcx
+	jmp	3f
+
+2:	mov	(%r10), %rax
+	mov	(%r11), %rcx
+	\op	%ax, %cx
+	jmp	3f
+
+4:	mov	(%r10), %rax
+	mov	(%r11), %rcx
+	\op	%al, %cl
+
+3:	lahf
+	seto	%al
+	mov	0x170(%rdx), %r10
+	and	$0xFFFFFFFFFFFFF72A, %r10
+	movzbl	%ah, %ecx
+	or	%rcx, %r10
+	movzbl	%al, %ecx
+	shl	$11, %rcx
+	or	%rcx, %r10
+	mov	%r10, 0x170(%rdx)
+.endm
+
+/* ─── MOV r/m, r (0x88, 0x89) ─── */
 .Lhandle_modrm_rr:
-	movzbl	(%r12, %r15, 1), %ecx
-	inc	%r15
-	/* Check mod == 11 (register-register) */
+	movzbl	(%rdi, %r8, 1), %ecx
+	inc	%r8
 	mov	%ecx, %eax
 	shr	$6, %eax
 	cmp	$3, %eax
-	jne	.Lhandle_memop_modrm	/* Memory operand — fallback */
+	jne	.Lhandle_memop_modrm
 
-	/* reg field = source, rm field = destination */
 	ANNOTATE_INTRA_FUNCTION_CALL
 	call	.Lextract_reg_rm
-	/* r8 = source reg ptr, r9 = dest reg ptr */
-	mov	(%r8), %rax
-	mov	%rax, (%r9)
+	
+	/* For MOV, simply copy based on operand size. No RFLAGS. */
+.Lhandle_modrm_rr_size_check:
+	test	$0x010000, %r9d
+	jz	4f
+	test	$0x08, %r9b
+	jnz	1f
+	test	$0x100, %r9d
+	jnz	2f
 
-	mov	%r15d, %eax
+	/* 32-bit */
+	mov	(%r10), %eax
+	mov	%eax, %eax
+	mov	(%r11), %rcx
+	mov	%eax, %ecx
+	mov	%rcx, (%r11)
+	jmp	.Ldone_alu
+
+1:	/* 64-bit */
+	mov	(%r10), %rax
+	mov	%rax, (%r11)
+	jmp	.Ldone_alu
+
+2:	/* 16-bit */
+	mov	(%r10), %rax
+	mov	(%r11), %rcx
+	mov	%ax, %cx
+	mov	%rcx, (%r11)
+	jmp	.Ldone_alu
+
+4:	/* 8-bit */
+	mov	(%r10), %rax
+	mov	(%r11), %rcx
+	mov	%al, %cl
+	mov	%rcx, (%r11)
+
+.Ldone_alu:
+	mov	%r8d, %eax
 	or	$RET_EMULATED, %eax
 	jmp	.Lreturn
 
-/* ─── MOV r, r/m (0x8B) — mod=11 only ─── */
+/* ─── MOV r, r/m (0x8A, 0x8B) ─── */
 .Lhandle_modrm_rr_rev:
-	movzbl	(%r12, %r15, 1), %ecx
-	inc	%r15
+	movzbl	(%rdi, %r8, 1), %ecx
+	inc	%r8
 	mov	%ecx, %eax
 	shr	$6, %eax
 	cmp	$3, %eax
 	jne	.Lhandle_memop_modrm
-
+	
 	ANNOTATE_INTRA_FUNCTION_CALL
 	call	.Lextract_reg_rm
-	/* reg = destination, rm = source (reversed) */
-	mov	(%r9), %rax
-	mov	%rax, (%r8)
+	/* Exchange src and dst pointers */
+	xchg	%r10, %r11
+	jmp	.Lhandle_modrm_rr_size_check
 
-	mov	%r15d, %eax
-	or	$RET_EMULATED, %eax
-	jmp	.Lreturn
-
-/* ─── XOR r/m, r (0x31) — mod=11: dst ^= src, update RFLAGS ─── */
+/* ─── XOR r/m, r (0x30, 0x31) ─── */
 .Lhandle_xor:
-	movzbl	(%r12, %r15, 1), %ecx
-	inc	%r15
+	movzbl	(%rdi, %r8, 1), %ecx
+	inc	%r8
 	mov	%ecx, %eax
 	shr	$6, %eax
 	cmp	$3, %eax
@@ -345,20 +480,13 @@ SYM_FUNC_START(svm_decode_insn)
 
 	ANNOTATE_INTRA_FUNCTION_CALL
 	call	.Lextract_reg_rm
-	mov	(%r8), %rax		/* source */
-	xor	%rax, (%r9)		/* XOR into dest — sets real RFLAGS */
-	pushfq
-	pop	%rax
-	mov	%rax, SAVE_RFLAGS(%r14)	/* Store RFLAGS to vmcb */
+	EMU_ALU xor
+	jmp	.Ldone_alu
 
-	mov	%r15d, %eax
-	or	$RET_EMULATED, %eax
-	jmp	.Lreturn
-
-/* ─── XOR r, r/m (0x33) ─── */
+/* ─── XOR r, r/m (0x32, 0x33) ─── */
 .Lhandle_xor_rev:
-	movzbl	(%r12, %r15, 1), %ecx
-	inc	%r15
+	movzbl	(%rdi, %r8, 1), %ecx
+	inc	%r8
 	mov	%ecx, %eax
 	shr	$6, %eax
 	cmp	$3, %eax
@@ -366,20 +494,14 @@ SYM_FUNC_START(svm_decode_insn)
 
 	ANNOTATE_INTRA_FUNCTION_CALL
 	call	.Lextract_reg_rm
-	mov	(%r9), %rax
-	xor	%rax, (%r8)
-	pushfq
-	pop	%rax
-	mov	%rax, SAVE_RFLAGS(%r14)
+	xchg	%r10, %r11
+	EMU_ALU xor
+	jmp	.Ldone_alu
 
-	mov	%r15d, %eax
-	or	$RET_EMULATED, %eax
-	jmp	.Lreturn
-
-/* ─── CMP r/m, r (0x39) — no write, only RFLAGS ─── */
+/* ─── CMP r/m, r (0x38, 0x39) ─── */
 .Lhandle_cmp:
-	movzbl	(%r12, %r15, 1), %ecx
-	inc	%r15
+	movzbl	(%rdi, %r8, 1), %ecx
+	inc	%r8
 	mov	%ecx, %eax
 	shr	$6, %eax
 	cmp	$3, %eax
@@ -387,20 +509,13 @@ SYM_FUNC_START(svm_decode_insn)
 
 	ANNOTATE_INTRA_FUNCTION_CALL
 	call	.Lextract_reg_rm
-	mov	(%r9), %rax
-	cmp	(%r8), %rax		/* CMP rm, reg */
-	pushfq
-	pop	%rax
-	mov	%rax, SAVE_RFLAGS(%r14)
+	EMU_ALU_NO_WRITE cmp
+	jmp	.Ldone_alu
 
-	mov	%r15d, %eax
-	or	$RET_EMULATED, %eax
-	jmp	.Lreturn
-
-/* ─── CMP r, r/m (0x3B) ─── */
+/* ─── CMP r, r/m (0x3A, 0x3B) ─── */
 .Lhandle_cmp_rev:
-	movzbl	(%r12, %r15, 1), %ecx
-	inc	%r15
+	movzbl	(%rdi, %r8, 1), %ecx
+	inc	%r8
 	mov	%ecx, %eax
 	shr	$6, %eax
 	cmp	$3, %eax
@@ -408,20 +523,14 @@ SYM_FUNC_START(svm_decode_insn)
 
 	ANNOTATE_INTRA_FUNCTION_CALL
 	call	.Lextract_reg_rm
-	mov	(%r8), %rax
-	cmp	(%r9), %rax
-	pushfq
-	pop	%rax
-	mov	%rax, SAVE_RFLAGS(%r14)
+	xchg	%r10, %r11
+	EMU_ALU_NO_WRITE cmp
+	jmp	.Ldone_alu
 
-	mov	%r15d, %eax
-	or	$RET_EMULATED, %eax
-	jmp	.Lreturn
-
-/* ─── TEST r/m, r (0x85) ─── */
+/* ─── TEST r/m, r (0x84, 0x85) ─── */
 .Lhandle_test:
-	movzbl	(%r12, %r15, 1), %ecx
-	inc	%r15
+	movzbl	(%rdi, %r8, 1), %ecx
+	inc	%r8
 	mov	%ecx, %eax
 	shr	$6, %eax
 	cmp	$3, %eax
@@ -429,20 +538,13 @@ SYM_FUNC_START(svm_decode_insn)
 
 	ANNOTATE_INTRA_FUNCTION_CALL
 	call	.Lextract_reg_rm
-	mov	(%r8), %rax
-	test	%rax, (%r9)
-	pushfq
-	pop	%rax
-	mov	%rax, SAVE_RFLAGS(%r14)
+	EMU_ALU_NO_WRITE test
+	jmp	.Ldone_alu
 
-	mov	%r15d, %eax
-	or	$RET_EMULATED, %eax
-	jmp	.Lreturn
-
-/* ─── ADD r/m, r (0x01) ─── */
+/* ─── ADD r/m, r (0x00, 0x01) ─── */
 .Lhandle_add:
-	movzbl	(%r12, %r15, 1), %ecx
-	inc	%r15
+	movzbl	(%rdi, %r8, 1), %ecx
+	inc	%r8
 	mov	%ecx, %eax
 	shr	$6, %eax
 	cmp	$3, %eax
@@ -450,20 +552,13 @@ SYM_FUNC_START(svm_decode_insn)
 
 	ANNOTATE_INTRA_FUNCTION_CALL
 	call	.Lextract_reg_rm
-	mov	(%r8), %rax
-	add	%rax, (%r9)
-	pushfq
-	pop	%rax
-	mov	%rax, SAVE_RFLAGS(%r14)
+	EMU_ALU add
+	jmp	.Ldone_alu
 
-	mov	%r15d, %eax
-	or	$RET_EMULATED, %eax
-	jmp	.Lreturn
-
-/* ─── SUB r/m, r (0x29) ─── */
+/* ─── SUB r/m, r (0x28, 0x29) ─── */
 .Lhandle_sub:
-	movzbl	(%r12, %r15, 1), %ecx
-	inc	%r15
+	movzbl	(%rdi, %r8, 1), %ecx
+	inc	%r8
 	mov	%ecx, %eax
 	shr	$6, %eax
 	cmp	$3, %eax
@@ -471,20 +566,13 @@ SYM_FUNC_START(svm_decode_insn)
 
 	ANNOTATE_INTRA_FUNCTION_CALL
 	call	.Lextract_reg_rm
-	mov	(%r8), %rax
-	sub	%rax, (%r9)
-	pushfq
-	pop	%rax
-	mov	%rax, SAVE_RFLAGS(%r14)
+	EMU_ALU sub
+	jmp	.Ldone_alu
 
-	mov	%r15d, %eax
-	or	$RET_EMULATED, %eax
-	jmp	.Lreturn
-
-/* ─── AND r/m, r (0x21) ─── */
+/* ─── AND r/m, r (0x20, 0x21) ─── */
 .Lhandle_and:
-	movzbl	(%r12, %r15, 1), %ecx
-	inc	%r15
+	movzbl	(%rdi, %r8, 1), %ecx
+	inc	%r8
 	mov	%ecx, %eax
 	shr	$6, %eax
 	cmp	$3, %eax
@@ -492,20 +580,13 @@ SYM_FUNC_START(svm_decode_insn)
 
 	ANNOTATE_INTRA_FUNCTION_CALL
 	call	.Lextract_reg_rm
-	mov	(%r8), %rax
-	and	%rax, (%r9)
-	pushfq
-	pop	%rax
-	mov	%rax, SAVE_RFLAGS(%r14)
+	EMU_ALU and
+	jmp	.Ldone_alu
 
-	mov	%r15d, %eax
-	or	$RET_EMULATED, %eax
-	jmp	.Lreturn
-
-/* ─── OR r/m, r (0x09) ─── */
+/* ─── OR r/m, r (0x08, 0x09) ─── */
 .Lhandle_or:
-	movzbl	(%r12, %r15, 1), %ecx
-	inc	%r15
+	movzbl	(%rdi, %r8, 1), %ecx
+	inc	%r8
 	mov	%ecx, %eax
 	shr	$6, %eax
 	cmp	$3, %eax
@@ -513,40 +594,33 @@ SYM_FUNC_START(svm_decode_insn)
 
 	ANNOTATE_INTRA_FUNCTION_CALL
 	call	.Lextract_reg_rm
-	mov	(%r8), %rax
-	or	%rax, (%r9)
-	pushfq
-	pop	%rax
-	mov	%rax, SAVE_RFLAGS(%r14)
-
-	mov	%r15d, %eax
-	or	$RET_EMULATED, %eax
-	jmp	.Lreturn
+	EMU_ALU or
+	jmp	.Ldone_alu
 
 /* ─── JMP rel8 (0xEB) ─── */
 .Lhandle_jmp_rel8:
-	movsbl	(%r12, %r15, 1), %eax	/* Sign-extend rel8 */
-	inc	%r15
+	movsbl	(%rdi, %r8, 1), %eax	/* Sign-extend rel8 */
+	inc	%r8
 	/* new_rip = current_rip + insn_len + rel8 */
 	movslq	%eax, %rax
-	add	%r15, %rax		/* + instruction length */
-	add	SAVE_RIP(%r14), %rax	/* + original RIP */
-	mov	%rax, SAVE_RIP(%r14)
+	add	%r8, %rax		/* + instruction length */
+	add	SAVE_RIP(%rdx), %rax	/* + original RIP */
+	mov	%rax, SAVE_RIP(%rdx)
 
-	mov	%r15d, %eax
+	mov	%r8d, %eax
 	or	$(RET_EMULATED | RET_BRANCH), %eax
 	jmp	.Lreturn
 
 /* ─── JMP rel32 (0xE9) ─── */
 .Lhandle_jmp_rel32:
-	movl	(%r12, %r15, 1), %eax	/* Load rel32 */
-	add	$4, %r15
+	movl	(%rdi, %r8, 1), %eax	/* Load rel32 */
+	add	$4, %r8
 	movslq	%eax, %rax
-	add	%r15, %rax
-	add	SAVE_RIP(%r14), %rax
-	mov	%rax, SAVE_RIP(%r14)
+	add	%r8, %rax
+	add	SAVE_RIP(%rdx), %rax
+	mov	%rax, SAVE_RIP(%rdx)
 
-	mov	%r15d, %eax
+	mov	%r8d, %eax
 	or	$(RET_EMULATED | RET_BRANCH), %eax
 	jmp	.Lreturn
 
@@ -554,11 +628,11 @@ SYM_FUNC_START(svm_decode_insn)
 .Lhandle_jcc_rel8:
 	/* AL still has the opcode byte (0x70-0x7F) */
 	sub	$0x70, %al		/* condition code = AL & 0x0F */
-	movsbl	(%r12, %r15, 1), %ecx	/* rel8 displacement */
-	inc	%r15
+	movsbl	(%rdi, %r8, 1), %ecx	/* rel8 displacement */
+	inc	%r8
 
 	/* Check condition using guest RFLAGS */
-	mov	SAVE_RFLAGS(%r14), %r8
+	mov	SAVE_RFLAGS(%rdx), %r8
 	push	%r8
 	popfq				/* Load guest RFLAGS into CPU */
 
@@ -575,26 +649,26 @@ SYM_FUNC_START(svm_decode_insn)
 
 	/* Branch taken: modify RIP */
 	movslq	%ecx, %rcx
-	add	%r15, %rcx
-	add	SAVE_RIP(%r14), %rcx
-	mov	%rcx, SAVE_RIP(%r14)
+	add	%r8, %rcx
+	add	SAVE_RIP(%rdx), %rcx
+	mov	%rcx, SAVE_RIP(%rdx)
 
-	mov	%r15d, %eax
+	mov	%r8d, %eax
 	or	$(RET_EMULATED | RET_BRANCH), %eax
 	jmp	.Lreturn
 
 .Ljcc_not_taken:
-	mov	%r15d, %eax
+	mov	%r8d, %eax
 	or	$RET_EMULATED, %eax
 	jmp	.Lreturn
 
 /* ─── Jcc rel32 (0x0F 0x80-0x8F) ─── */
 .Lhandle_jcc_rel32:
 	sub	$0x80, %al		/* condition code */
-	movl	(%r12, %r15, 1), %ecx
-	add	$4, %r15
+	movl	(%rdi, %r8, 1), %ecx
+	add	$4, %r8
 
-	mov	SAVE_RFLAGS(%r14), %r8
+	mov	SAVE_RFLAGS(%rdx), %r8
 	push	%r8
 	popfq
 
@@ -605,16 +679,16 @@ SYM_FUNC_START(svm_decode_insn)
 	jz	.Ljcc32_not_taken
 
 	movslq	%ecx, %rcx
-	add	%r15, %rcx
-	add	SAVE_RIP(%r14), %rcx
-	mov	%rcx, SAVE_RIP(%r14)
+	add	%r8, %rcx
+	add	SAVE_RIP(%rdx), %rcx
+	mov	%rcx, SAVE_RIP(%rdx)
 
-	mov	%r15d, %eax
+	mov	%r8d, %eax
 	or	$(RET_EMULATED | RET_BRANCH), %eax
 	jmp	.Lreturn
 
 .Ljcc32_not_taken:
-	mov	%r15d, %eax
+	mov	%r8d, %eax
 	or	$RET_EMULATED, %eax
 	jmp	.Lreturn
 
@@ -624,22 +698,22 @@ SYM_FUNC_START(svm_decode_insn)
 	/* Store into guest RAX and RDX */
 	mov	%eax, %ecx
 	mov	%edx, %r8d
-	movl	%ecx, SAVE_RAX(%r14)	/* Low 32 bits → guest RAX */
-	movq	%r8, GREGS_RDX(%r13)	/* High 32 bits → guest RDX */
+	movl	%ecx, SAVE_RAX(%rdx)	/* Low 32 bits → guest RAX */
+	movq	%r8, GREGS_RDX(%rsi)	/* High 32 bits → guest RDX */
 
-	mov	%r15d, %eax
+	mov	%r8d, %eax
 	or	$RET_EMULATED, %eax
 	jmp	.Lreturn
 
 /* ─── Memory-op Fallbacks ─── */
 .Lhandle_memop_1byte:
-	mov	%r15d, %eax
+	mov	%r8d, %eax
 	or	$RET_MEMOP, %eax
 	jmp	.Lreturn
 
 .Lhandle_memop_5byte:
-	add	$4, %r15d		/* skip imm32 */
-	mov	%r15d, %eax
+	add	$4, %r8d		/* skip imm32 */
+	mov	%r8d, %eax
 	or	$RET_MEMOP, %eax
 	jmp	.Lreturn
 
@@ -647,7 +721,7 @@ SYM_FUNC_START(svm_decode_insn)
 	/* cursor already past opcode, need to skip ModRM operand */
 	ANNOTATE_INTRA_FUNCTION_CALL
 	call	.Lskip_modrm_operand
-	mov	%r15d, %eax
+	mov	%r8d, %eax
 	or	$RET_MEMOP, %eax
 	jmp	.Lreturn
 
@@ -670,7 +744,7 @@ SYM_FUNC_START(svm_decode_insn)
 	shr	$3, %eax
 	and	$7, %eax
 	/* Apply REX.R extension */
-	test	$4, %ebx		/* REX.R = bit 2 */
+	test	$4, %r9d		/* REX.R = bit 2 */
 	jz	1f
 	or	$8, %eax
 1:
@@ -679,29 +753,29 @@ SYM_FUNC_START(svm_decode_insn)
 	movzwl	(%r10, %rax, 2), %r11d
 	test	$VMCB_FLAG, %r11d
 	jnz	2f
-	lea	(%r13, %r11, 1), %r8	/* guest_regs + offset */
+	lea	(%rsi, %r11, 1), %r8	/* guest_regs + offset */
 	jmp	3f
 2:
 	and	$0x7FFF, %r11d
-	lea	(%r14, %r11, 1), %r8	/* vmcb_save + offset */
+	lea	(%rdx, %r11, 1), %r8	/* vmcb_save + offset */
 3:
 
 	/* Extract rm field: bits [2:0] of ModRM */
 	mov	%ecx, %eax
 	and	$7, %eax
 	/* Apply REX.B extension */
-	test	$1, %ebx		/* REX.B = bit 0 */
+	test	$1, %r9d		/* REX.B = bit 0 */
 	jz	4f
 	or	$8, %eax
 4:
 	movzwl	(%r10, %rax, 2), %r11d
 	test	$VMCB_FLAG, %r11d
 	jnz	5f
-	lea	(%r13, %r11, 1), %r9
+	lea	(%rsi, %r11, 1), %r9
 	jmp	6f
 5:
 	and	$0x7FFF, %r11d
-	lea	(%r14, %r11, 1), %r9
+	lea	(%rdx, %r11, 1), %r9
 6:
 	pop	%rax
 	ret
@@ -725,7 +799,7 @@ SYM_FUNC_START(svm_decode_insn)
 	/* Check for SIB byte: rm==4 AND mod != 11 */
 	cmp	$4, %r8d
 	jne	.Lskip_no_sib
-	inc	%r15			/* Skip SIB byte */
+	inc	%r8			/* Skip SIB byte */
 .Lskip_no_sib:
 
 	/* mod=00: no displacement (except rm=5 → disp32) */
@@ -733,17 +807,17 @@ SYM_FUNC_START(svm_decode_insn)
 	jnz	.Lskip_mod01
 	cmp	$5, %r8d
 	jne	.Lskip_done
-	add	$4, %r15		/* RIP-relative disp32 */
+	add	$4, %r8		/* RIP-relative disp32 */
 	jmp	.Lskip_done
 
 .Lskip_mod01:
 	cmp	$1, %eax		/* mod=01: disp8 */
 	jne	.Lskip_mod10
-	inc	%r15
+	inc	%r8
 	jmp	.Lskip_done
 
 .Lskip_mod10:			/* mod=10: disp32 */
-	add	$4, %r15
+	add	$4, %r8
 
 .Lskip_done:
 	ret
@@ -757,7 +831,7 @@ SYM_FUNC_START(svm_decode_insn)
 	/* Use the CPU's own condition evaluation via CMOV.
 	 * Load 0 into ECX, 1 into EDX, then CMOVcc selects.
 	 */
-	push	%rbx
+	push	%r9
 	xor	%ecx, %ecx
 	mov	$1, %edx
 
@@ -792,7 +866,7 @@ SYM_FUNC_START(svm_decode_insn)
 
 	/* JP/JNP (10,11) — rare, treat as not taken */
 	xor	%eax, %eax
-	pop	%rbx
+	pop	%r9
 	ret
 
 .Lcond_o:	cmovo	%edx, %ecx;	jmp .Lcond_ret
@@ -812,18 +886,18 @@ SYM_FUNC_START(svm_decode_insn)
 
 .Lcond_ret:
 	mov	%ecx, %eax
-	pop	%rbx
+	pop	%r9
 	ret
 
 /* ═══════════════════════════════════════════════════════════════════════════
  *  Return
  * ═══════════════════════════════════════════════════════════════════════════ */
 .Lreturn:
-	pop	%r15
-	pop	%r14
-	pop	%r13
-	pop	%r12
-	pop	%rbx
+	pop	%r8
+	pop	%rdx
+	pop	%rsi
+	pop	%rdi
+	pop	%r9
 	RET
 SYM_FUNC_END(svm_decode_insn)
 

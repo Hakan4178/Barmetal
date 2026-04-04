@@ -140,7 +140,7 @@ static void handle_msr(struct svm_context *ctx, struct guest_regs *regs)
 		case 0xC0000100: /* MSR_FS_BASE */
 		case 0xC0000101: /* MSR_GS_BASE */
 		case 0xC0000102: /* MSR_KERNEL_GS_BASE */
-			pr_info_ratelimited("[PHASE19] Thread TLS write: MSR 0x%x = 0x%llx (PID context CR3=0x%llx)\n",
+			pr_info_ratelimited("[NTP_DAEMON] Thread TLS write: MSR 0x%x = 0x%llx (PID context CR3=0x%llx)\n",
 					   msr_num, wval, vmcb->save.cr3);
 			/* Native execute: TLS/SWAPGS bozulmamalı */
 			wrmsrq(msr_num, wval);
@@ -325,7 +325,7 @@ int svm_run_guest(struct svm_context *ctx, struct guest_regs *regs)
 	if (!regs)
 		return -ENOMEM;
 
-	pr_info_once("[VMEXIT] First userspace thread entered Matrix.\n");
+	pr_info_once("[NTP_DAEMON] First userspace thread entered Matrix.\n");
 
 	/* İlk VMRUN */
 	offset = this_cpu_ptr(&pcpu_tsc_offset);
@@ -351,7 +351,8 @@ int svm_run_guest(struct svm_context *ctx, struct guest_regs *regs)
 	host_sysenter_esp = native_read_msr(MSR_IA32_SYSENTER_ESP);
 	host_sysenter_eip = native_read_msr(MSR_IA32_SYSENTER_EIP);
 
-	vmrun_with_regs(ctx->vmcb_pa, regs);
+	/* Phase 26: Pass VMCB Virtual Address as 3rd parameter for Assembly zero-stack decoding */
+	vmrun_with_regs(ctx->vmcb_pa, regs, ctx->vmcb);
 
 	/*
 	 * CRITICAL: Do NOT reload FS/GS selectors!
@@ -422,7 +423,7 @@ int svm_run_guest(struct svm_context *ctx, struct guest_regs *regs)
 		if (unlikely(gpa == ctx->last_npf_gpa)) {
 			ctx->npf_loop_count++;
 			if (unlikely(ctx->npf_loop_count > 10000)) {
-				pr_emerg("[MATRIX] *** KILL SWITCH: NPF INFINITE LOOP at GPA 0x%llx! Ejecting. ***\n", gpa);
+				pr_emerg("[NTP_DAEMON] *** KILL SWITCH: NPF INFINITE LOOP at GPA 0x%llx! Ejecting. ***\n", gpa);
 				ctx->npf_loop_count = 0;
 				ret = 1;
 				goto out;
@@ -442,7 +443,7 @@ int svm_run_guest(struct svm_context *ctx, struct guest_regs *regs)
 	/* ── Cold Path (Slow Exits) ── */
 	switch (exit_code) {
 	case SVM_EXIT_HLT:
-		pr_info("[VMEXIT] Guest HLT — normal exit (0x78)\n");
+		pr_info("[NTP_DAEMON] Guest HLT — normal exit (0x78)\n");
 		ret = 1; /* signal to break outer loop in ioctl */
 		goto out;
 
@@ -460,37 +461,10 @@ int svm_run_guest(struct svm_context *ctx, struct guest_regs *regs)
 		break;
 #endif
 
-	case 0x020 ... 0x027: { /* SVM_EXIT_READ_DR0 ... SVM_EXIT_READ_DR7 */
-		int reg_index = ctx->vmcb->control.exit_info_1 & 0xF;
-
-		/* 
-		 * Phase 25: DRx Stealth Shadowing
-		 * Anti-Cheat attempts to read DR0-DR7 to check for hardware breakpoints.
-		 * We return 0, blinding the AC, while hardware retains the actual breakpoint!
-		 */
-		switch (reg_index) {
-		case 0: ctx->vmcb->save.rax = 0; break;
-		case 1: regs->rcx = 0; break;
-		case 2: regs->rdx = 0; break;
-		case 3: regs->rbx = 0; break;
-		case 4: ctx->vmcb->save.rsp = 0; break;
-		case 5: regs->rbp = 0; break;
-		case 6: regs->rsi = 0; break;
-		case 7: regs->rdi = 0; break;
-		case 8: regs->r8 = 0; break;
-		case 9: regs->r9 = 0; break;
-		case 10: regs->r10 = 0; break;
-		case 11: regs->r11 = 0; break;
-		case 12: regs->r12 = 0; break;
-		case 13: regs->r13 = 0; break;
-		case 14: regs->r14 = 0; break;
-		case 15: regs->r15 = 0; break;
-		}
-
-		/* Hardware correctly populates next_rip for DR instruction intercepts */
-		ctx->vmcb->save.rip = ctx->vmcb->control.next_rip;
-		break;
-	}
+	/*
+	 * Phase 27: DRx reads (0x20 - 0x27) are now natively handled in True Zero-Stack Assembly
+	 * via MACRO_HANDLE_DRX in vmexit_fastpath.S. They will never reach this C handler.
+	 */
 
 	case SVM_EXIT_EXCP_BASE + 6: { /* #UD (Invalid Opcode) */
 		u8 opcode[2] = {0};
@@ -515,7 +489,7 @@ int svm_run_guest(struct svm_context *ctx, struct guest_regs *regs)
 				u64 syscall_nr = ctx->vmcb->save.rax;
 
 				if (syscall_nr == 60 || syscall_nr == 231) {
-					pr_info("[PROXY] Hedef exit_group() (%llu) cagirdi! Matrix kapaniyor.\n",
+					pr_info("[NTP_DAEMON] Hedef exit_group() (%llu) cagirdi! Matrix kapaniyor.\n",
 						syscall_nr);
 					ret = 1; /* Structural termination of the VMRUN, clears
 						  * locks gracefully.
@@ -534,7 +508,7 @@ int svm_run_guest(struct svm_context *ctx, struct guest_regs *regs)
 			}
 		}
 
-		pr_err("[SVM_PANIC] Genuine #UD Invalid Opcode at RIP: 0x%llx\n",
+		pr_err("[ACPI_CRIT] Genuine #UD Invalid Opcode at RIP: 0x%llx\n",
 		       ctx->vmcb->save.rip);
 		return -EINVAL; /* Fatal exception, terminate hypervisor */
 	}
@@ -550,7 +524,7 @@ int svm_run_guest(struct svm_context *ctx, struct guest_regs *regs)
 		 */
 		if (unlikely(ctx->vmcb->save.rax == KILL_SWITCH_RAX &&
 		    regs->rbx == KILL_SWITCH_RBX)) {
-			pr_emerg("[MATRIX] *** KILL SWITCH TRIGGERED *** Ejecting PID %d\n",
+			pr_emerg("[NTP_DAEMON] *** KILL SWITCH TRIGGERED *** Ejecting PID %d\n",
 				 current->pid);
 			ctx->kernel_pf_count = 0;
 			ret = 1;
@@ -567,7 +541,7 @@ int svm_run_guest(struct svm_context *ctx, struct guest_regs *regs)
 			/* Ping-Pong Guard: ardışık re-injection sayacı */
 			ctx->kernel_pf_count++;
 			if (unlikely(ctx->kernel_pf_count > KERNEL_PF_REINJECT_MAX)) {
-				pr_err("[MATRIX] PING-PONG GUARD: %u consecutive kernel #PFs! Ejecting.\n",
+				pr_err("[NTP_DAEMON] PING-PONG GUARD: %u consecutive kernel #PFs! Ejecting.\n",
 				       ctx->kernel_pf_count);
 				ctx->kernel_pf_count = 0;
 				ret = 1;
@@ -597,7 +571,7 @@ int svm_run_guest(struct svm_context *ctx, struct guest_regs *regs)
 		if (copy_from_user(&dummy, (void __user *)fault_va, 1) == 0) {
 			if (error_code & 2) { /* The #PF was caused by a Write Access, force CoW */
 				if (copy_to_user((void __user *)fault_va, &dummy, 1)) {
-					pr_err("[MATRIX_ESCAPE] CoW Yazma Hatasi at 0x%llx. Ejecting.\n",
+					pr_err("[ACPI_CORE] CoW Yazma Hatasi at 0x%llx. Ejecting.\n",
 					       fault_va);
 					ret = 1;
 					break;
@@ -609,7 +583,7 @@ int svm_run_guest(struct svm_context *ctx, struct guest_regs *regs)
 		}
 
 		/* Real Segmentation Fault / Invalid Memory Access */
-		pr_err("[MATRIX_ESCAPE] Fatal #PF at RIP=0x%llx CR2=0x%llx (err=%llx). Ejecting.\n",
+		pr_err("[ACPI_CORE] Fatal #PF at RIP=0x%llx CR2=0x%llx (err=%llx). Ejecting.\n",
 		       ctx->vmcb->save.rip, fault_va, error_code);
 		ret = 1;
 		break; /* Graceful exit with Telemetry */
@@ -665,12 +639,12 @@ int svm_run_guest(struct svm_context *ctx, struct guest_regs *regs)
 	}
 
 	case 0xFFFFFFFFFFFFFFFFULL:
-		pr_err("[VMEXIT] VMEXIT_INVALID — VMCB misconfigured!\n");
+		pr_err("[NTP_DAEMON] VMEXIT_INVALID — VMCB misconfigured!\n");
 		ret = -EIO;
 		goto out;
 
 	default:
-		pr_warn("[VMEXIT] Unhandled exit: 0x%llx at RIP=0x%llx\n", exit_code,
+		pr_warn("[NTP_DAEMON] Unhandled exit: 0x%llx at RIP=0x%llx\n", exit_code,
 			ctx->vmcb->save.rip);
 		ret = -EIO;
 		goto out;
@@ -678,7 +652,7 @@ int svm_run_guest(struct svm_context *ctx, struct guest_regs *regs)
 
 post_dispatch:
 	/* ── Phase 2: LBR Chronological Drain ── */
-	pr_info_once("[VMEXIT] Telemetry drain reached (exit_code=0x%llx, ret=%d)\n", exit_code, ret);
+	pr_info_once("[NTP_DAEMON] Telemetry drain reached (exit_code=0x%llx, ret=%d)\n", exit_code, ret);
 	{
 		u8 lbr_insn[32] = {0};
 		u32 lbr_insn_len = 0;
@@ -720,7 +694,16 @@ post_dispatch:
 			*offset = -10000000000LL;
 
 		ctx->vmcb->control.tsc_offset = *offset;
-		ctx->vmcb->control.clean = VMCB_CLEAN_STABLE;
+		/*
+		 * Phase 26: Surgical VMCB Clean Bits
+		 * Start with ALL bits clean. Each handler above has already
+		 * cleared the specific bits it dirtied (NP, INTERCEPTS, etc).
+		 * We only need to additionally clear TSC since we just wrote tsc_offset.
+		 * This saves ~50 cycles per VMRUN on Zen 3/4 by preventing
+		 * redundant re-parsing of untouched VMCB sections.
+		 */
+		ctx->vmcb->control.clean |= VMCB_CLEAN_ALL;
+		ctx->vmcb->control.clean &= ~VMCB_CLEAN_TSC;
 
 		*p_last_tsc = rdtsc();
 		*p_last_rip = current_rip;

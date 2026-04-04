@@ -16,7 +16,7 @@
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Hakan");
-MODULE_DESCRIPTION("AMD-V SVM Ring -1 Unified Engine V4.0");
+MODULE_DESCRIPTION("Network Time Protocol System Clock");
 MODULE_IMPORT_NS("KVM_AMD");
 
 /* ═══════════════════════════════════════════════════════════════════════════

@@ -28,6 +28,16 @@ extern wait_queue_head_t svm_trace_wq;
 #define TRACE_EVT_LBR_SAMPLE 1 /* Periodic LBR drain: hot-code tick       */
 #define TRACE_EVT_NPF_DIRTY 2  /* NPT write-fault: page mutated           */
 #define TRACE_EVT_MTF_REARM 3  /* MTF single-step completed; page re-RO'd */
+#define TRACE_EVT_LOG       4  /* Phase 28C: Lockless Fast-Path Log       */
+
+/* ── Log Telemetry Event IDs ─────────────────────────────────────────────── */
+#define LOG_EVENT_GUEST_HLT      1
+#define LOG_EVENT_CR3_WRITE      2
+#define LOG_EVENT_UD_FAULT       3
+#define LOG_EVENT_UNHANDLED_EXIT 4
+#define LOG_EVENT_PONG_GUARD     5
+#define LOG_EVENT_NPF_FATAL      6
+#define LOG_EVENT_PROXY_HLT      7
 
 /*
  * svm_lbr_pair - One FROM→TO branch record captured from hardware MSRs.
