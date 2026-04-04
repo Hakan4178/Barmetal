@@ -40,6 +40,17 @@ ENTRY_FMT = "<QQIIQQQI I32Q".replace(" ", "")
 ENTRY_SIZE = struct.calcsize(ENTRY_FMT)
 MAGIC_EXPECTED = 0x5356545200000000
 
+# ── Phase 28C: Lockless Telemetry Event Decoder ──
+LOG_EVENT_NAMES = {
+    1: "Guest HLT — Normal Exit (0x78)",
+    2: "Thread TLS/SWAPGS MSR Write",
+    3: "Genuine #UD Invalid Opcode",
+    4: "VMEXIT_INVALID / Unhandled Exit",
+    5: "PING-PONG GUARD: Kernel #PF Streak",
+    6: "Fatal #PF / CoW Write Error — Ejecting",
+    7: "Target exit_group() — Matrix Closing",
+}
+
 # ── Linux Syscall Table (x86_64) for human-readable display ──
 SYSCALL_NAMES = {
     0: "read", 1: "write", 2: "open", 3: "close", 4: "stat", 5: "fstat",
@@ -316,6 +327,11 @@ def trace_reader_proc(trace_file, q_out):
                         try:
                             q_out.put_nowait(('MUT', tsc, cr3, rip, gpa, payload))
                         except Exception: pass
+
+                    elif ev_type == 4:  # Phase 28C: LOG EVENT
+                        try:
+                            q_out.put_nowait(('LOG', tsc, lbr_count, rip, gpa, cr3))
+                        except Exception: pass
                     
                     cbuf.consume(total_expected)
     except KeyboardInterrupt:
@@ -367,9 +383,10 @@ class LiveDashboard:
         curses.init_pair(6, curses.COLOR_WHITE, curses.COLOR_RED)   # CRITICAL BG
         curses.init_pair(7, curses.COLOR_BLACK, curses.COLOR_YELLOW) # Deep Dive BG
 
-        self.stats = {"lbr": 0, "dirty": 0, "high_ent": 0, "drops": 0, "syscalls": 0}
+        self.stats = {"lbr": 0, "dirty": 0, "high_ent": 0, "drops": 0, "syscalls": 0, "logs": 0}
         self.recent_branches = collections.deque(maxlen=200)
         self.recent_mutations = collections.deque(maxlen=100)
+        self.recent_logs = collections.deque(maxlen=50)
         self.session_log = []
         
         # Heatmap: GPA page -> mutation count
@@ -491,6 +508,16 @@ class LiveDashboard:
                 
                 if self.log_file:
                     self.session_log.append(f"\n[MUTATION] TSC: {tsc} | CR3: 0x{cr3:016x} | Fault RIP: 0x{rip:016x} | GPA: 0x{gpa:016x} | ASM: {asm_str}")
+            elif msg[0] == 'LOG':
+                _, tsc, event_id, rip, arg1, arg2 = msg
+                self.stats["logs"] += 1
+                event_text = LOG_EVENT_NAMES.get(event_id, f"Unknown Event #{event_id}")
+                self.recent_logs.appendleft({
+                    'tsc': tsc, 'id': event_id, 'text': event_text,
+                    'rip': rip, 'arg1': arg1, 'arg2': arg2
+                })
+                if self.log_file:
+                    self.session_log.append(f"[LOG] TSC: {tsc} | {event_text} | RIP: 0x{rip:016x} | A1: 0x{arg1:x} | A2: 0x{arg2:x}")
 
     def draw(self):
         self.stdscr.erase()

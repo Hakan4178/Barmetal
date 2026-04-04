@@ -117,18 +117,27 @@ int npt_build_identity_map(struct npt_context *ctx, u64 phys_limit)
 		}
 
 		/*
-		 * MTRR safety: Mark I/O regions (above max_pfn) as Uncacheable.
-		 * RAM regions get Write-Back (default, bits clear).
-		 * This prevents system lockups on MMIO accesses.
+		 * MTRR + IOMMU safety: Use e820 map to classify memory type.
+		 * page_is_ram() checks the firmware's e820 table:
+		 *   - Returns 1 for actual system RAM → WB (Write-Back)
+		 *   - Returns 0 for MMIO, PCI BAR, Reserved, ACPI → UC (Uncacheable)
+		 *
+		 * This is safer than pfn_valid() which returns true for any PFN
+		 * with a struct page, including GPU MMIO BARs carved from low
+		 * physical address space (e.g. 0x61200000 Doorbell on AMD APU).
+		 *
+		 * Zen 4 MTRR: If NPT cache type conflicts with MTRR, the CPU
+		 * triggers an "Inconsistent Memory Types" machine check. Using
+		 * UC for non-RAM guarantees safety regardless of MTRR config.
 		 */
 		{
 			u64 cache_flags;
 			unsigned long pfn = addr >> PAGE_SHIFT;
 
-			if (!pfn_valid(pfn))
-				cache_flags = NPT_CACHE_UC; /* I/O / MMIO region */
+			if (!page_is_ram(pfn))
+				cache_flags = NPT_CACHE_UC; /* MMIO / PCI BAR / Reserved */
 			else
-				cache_flags = NPT_CACHE_WB; /* Normal RAM */
+				cache_flags = NPT_CACHE_WB; /* Verified system RAM */
 
 			/* Create 2MB leaf entry: GPA == HPA, PS=1, cache type set */
 			BUG_ON(addr & ((2ULL << 20) - 1)); /* Assert 2MB alignment */

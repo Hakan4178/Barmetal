@@ -217,10 +217,14 @@ static long svm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
 			put_cpu(); /* Preemption açık — scheduler göç yapabilir */
 
+			/* Phase 28C: Always yield to prevent ANR / soft-lockup.
+			 * Without this, syscall proxy (ret=2) breaks immediately
+			 * and never reaches cond_resched(), starving the core.
+			 */
+			cond_resched();
+
 			if (ret_loop != 0)
 				break;
-
-			cond_resched();
 		}
 
 		/* ─── EXIT & RESTORE ─── */

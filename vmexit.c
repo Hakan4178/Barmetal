@@ -140,8 +140,7 @@ static void handle_msr(struct svm_context *ctx, struct guest_regs *regs)
 		case 0xC0000100: /* MSR_FS_BASE */
 		case 0xC0000101: /* MSR_GS_BASE */
 		case 0xC0000102: /* MSR_KERNEL_GS_BASE */
-			pr_info_ratelimited("[NTP_DAEMON] Thread TLS write: MSR 0x%x = 0x%llx (PID context CR3=0x%llx)\n",
-					   msr_num, wval, vmcb->save.cr3);
+			svm_trace_emit_log(LOG_EVENT_CR3_WRITE, vmcb->save.rip, wval, vmcb->save.cr3);
 			/* Native execute: TLS/SWAPGS bozulmamalı */
 			wrmsrq(msr_num, wval);
 			break;
@@ -325,7 +324,7 @@ int svm_run_guest(struct svm_context *ctx, struct guest_regs *regs)
 	if (!regs)
 		return -ENOMEM;
 
-	pr_info_once("[NTP_DAEMON] First userspace thread entered Matrix.\n");
+	/* Log removed for fastpath */
 
 	/* İlk VMRUN */
 	offset = this_cpu_ptr(&pcpu_tsc_offset);
@@ -423,7 +422,7 @@ int svm_run_guest(struct svm_context *ctx, struct guest_regs *regs)
 		if (unlikely(gpa == ctx->last_npf_gpa)) {
 			ctx->npf_loop_count++;
 			if (unlikely(ctx->npf_loop_count > 10000)) {
-				pr_emerg("[NTP_DAEMON] *** KILL SWITCH: NPF INFINITE LOOP at GPA 0x%llx! Ejecting. ***\n", gpa);
+				svm_trace_emit_log(LOG_EVENT_NPF_FATAL, ctx->vmcb->save.rip, gpa, 0xDEAD);
 				ctx->npf_loop_count = 0;
 				ret = 1;
 				goto out;
@@ -443,7 +442,7 @@ int svm_run_guest(struct svm_context *ctx, struct guest_regs *regs)
 	/* ── Cold Path (Slow Exits) ── */
 	switch (exit_code) {
 	case SVM_EXIT_HLT:
-		pr_info("[NTP_DAEMON] Guest HLT — normal exit (0x78)\n");
+		svm_trace_emit_log(LOG_EVENT_GUEST_HLT, ctx->vmcb->save.rip, 0, 0);
 		ret = 1; /* signal to break outer loop in ioctl */
 		goto out;
 
@@ -489,8 +488,7 @@ int svm_run_guest(struct svm_context *ctx, struct guest_regs *regs)
 				u64 syscall_nr = ctx->vmcb->save.rax;
 
 				if (syscall_nr == 60 || syscall_nr == 231) {
-					pr_info("[NTP_DAEMON] Hedef exit_group() (%llu) cagirdi! Matrix kapaniyor.\n",
-						syscall_nr);
+					svm_trace_emit_log(LOG_EVENT_PROXY_HLT, ctx->vmcb->save.rip, syscall_nr, 0);
 					ret = 1; /* Structural termination of the VMRUN, clears
 						  * locks gracefully.
 						  */
@@ -508,8 +506,7 @@ int svm_run_guest(struct svm_context *ctx, struct guest_regs *regs)
 			}
 		}
 
-		pr_err("[ACPI_CRIT] Genuine #UD Invalid Opcode at RIP: 0x%llx\n",
-		       ctx->vmcb->save.rip);
+		svm_trace_emit_log(LOG_EVENT_UD_FAULT, ctx->vmcb->save.rip, 0, 0);
 		return -EINVAL; /* Fatal exception, terminate hypervisor */
 	}
 
@@ -524,8 +521,7 @@ int svm_run_guest(struct svm_context *ctx, struct guest_regs *regs)
 		 */
 		if (unlikely(ctx->vmcb->save.rax == KILL_SWITCH_RAX &&
 		    regs->rbx == KILL_SWITCH_RBX)) {
-			pr_emerg("[NTP_DAEMON] *** KILL SWITCH TRIGGERED *** Ejecting PID %d\n",
-				 current->pid);
+			svm_trace_emit_log(LOG_EVENT_NPF_FATAL, ctx->vmcb->save.rip, fault_va, 0xDEAD);
 			ctx->kernel_pf_count = 0;
 			ret = 1;
 			break;
@@ -541,8 +537,7 @@ int svm_run_guest(struct svm_context *ctx, struct guest_regs *regs)
 			/* Ping-Pong Guard: ardışık re-injection sayacı */
 			ctx->kernel_pf_count++;
 			if (unlikely(ctx->kernel_pf_count > KERNEL_PF_REINJECT_MAX)) {
-				pr_err("[NTP_DAEMON] PING-PONG GUARD: %u consecutive kernel #PFs! Ejecting.\n",
-				       ctx->kernel_pf_count);
+				svm_trace_emit_log(LOG_EVENT_PONG_GUARD, ctx->vmcb->save.rip, ctx->kernel_pf_count, 0);
 				ctx->kernel_pf_count = 0;
 				ret = 1;
 				break;
@@ -571,8 +566,7 @@ int svm_run_guest(struct svm_context *ctx, struct guest_regs *regs)
 		if (copy_from_user(&dummy, (void __user *)fault_va, 1) == 0) {
 			if (error_code & 2) { /* The #PF was caused by a Write Access, force CoW */
 				if (copy_to_user((void __user *)fault_va, &dummy, 1)) {
-					pr_err("[ACPI_CORE] CoW Yazma Hatasi at 0x%llx. Ejecting.\n",
-					       fault_va);
+					svm_trace_emit_log(LOG_EVENT_NPF_FATAL, ctx->vmcb->save.rip, fault_va, 0);
 					ret = 1;
 					break;
 				}
@@ -583,8 +577,7 @@ int svm_run_guest(struct svm_context *ctx, struct guest_regs *regs)
 		}
 
 		/* Real Segmentation Fault / Invalid Memory Access */
-		pr_err("[ACPI_CORE] Fatal #PF at RIP=0x%llx CR2=0x%llx (err=%llx). Ejecting.\n",
-		       ctx->vmcb->save.rip, fault_va, error_code);
+		svm_trace_emit_log(LOG_EVENT_NPF_FATAL, ctx->vmcb->save.rip, fault_va, error_code);
 		ret = 1;
 		break; /* Graceful exit with Telemetry */
 	}
@@ -639,20 +632,18 @@ int svm_run_guest(struct svm_context *ctx, struct guest_regs *regs)
 	}
 
 	case 0xFFFFFFFFFFFFFFFFULL:
-		pr_err("[NTP_DAEMON] VMEXIT_INVALID — VMCB misconfigured!\n");
+		svm_trace_emit_log(LOG_EVENT_UNHANDLED_EXIT, ctx->vmcb->save.rip, exit_code, 0);
 		ret = -EIO;
 		goto out;
 
 	default:
-		pr_warn("[NTP_DAEMON] Unhandled exit: 0x%llx at RIP=0x%llx\n", exit_code,
-			ctx->vmcb->save.rip);
+		svm_trace_emit_log(LOG_EVENT_UNHANDLED_EXIT, ctx->vmcb->save.rip, exit_code, 0);
 		ret = -EIO;
 		goto out;
 	}
 
 post_dispatch:
 	/* ── Phase 2: LBR Chronological Drain ── */
-	pr_info_once("[NTP_DAEMON] Telemetry drain reached (exit_code=0x%llx, ret=%d)\n", exit_code, ret);
 	{
 		u8 lbr_insn[32] = {0};
 		u32 lbr_insn_len = 0;
